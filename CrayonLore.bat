@@ -1,0 +1,72 @@
+@echo off
+title Crayon Lore
+
+echo.
+echo   ==============================================
+echo        CRAYON LORE
+echo     The backstory and lore of the
+echo        Crayon Diet universe.
+echo      AI storytelling, fully automated.
+echo   ==============================================
+echo.
+
+cd /d "F:\aaaaaVIBECODING\Crayon Lore"
+
+echo [CHECK] Python...
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [FAIL] Python not found. Please install Python 3.11+
+    pause
+    exit /b 1
+) else (
+    echo [OK] Python found
+)
+
+echo [CHECK] FFmpeg...
+ffmpeg -version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [FAIL] FFmpeg not found. Add it to PATH.
+    pause
+    exit /b 1
+) else (
+    echo [OK] FFmpeg found
+)
+
+echo [CHECK] PocketTTS server (port 8769)...
+curl -s -o nul http://127.0.0.1:8769/health 2>nul
+if %errorlevel% neq 0 (
+    echo [WARN] PocketTTS not running - attempting to start GPU server...
+    start "PocketTTS" /B F:\ComfyUI_windows_portable\python_embeded\python.exe -m pocket_tts serve --port 8769 --device cuda
+    timeout /t 15 /nobreak >nul
+) else (
+    echo [OK] PocketTTS server running
+)
+
+echo [CHECK] LM Studio (port 1234)...
+curl -s -o nul http://localhost:1234/v1/models 2>nul
+if %errorlevel% neq 0 (
+    echo [WARN] LM Studio not running on port 1234
+    echo        Start LM Studio first, then re-run this.
+    pause
+) else (
+    echo [OK] LM Studio ready
+)
+
+echo [CHECK] ComfyUI (port 8188)...
+curl -s -o nul http://127.0.0.1:8188/system_stats 2>nul
+if %errorlevel% neq 0 (
+    echo [WARN] ComfyUI not running on port 8188
+    echo        Only needed if you pick the LOCAL image backend.
+    echo        Codex / fal / runpod run fine without it.
+) else (
+    echo [OK] ComfyUI ready
+)
+
+echo.
+echo All checks passed. Starting Crayon Lore...
+echo.
+python crayon_lore.py
+
+echo.
+echo Episode complete. Press any key to exit.
+pause >nul

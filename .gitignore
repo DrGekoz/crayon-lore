@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets - NEVER commit
+.env
+client_secret_*.json
+*.credentials.json
+
+# Generated output (episodes) - all per-episode artifacts live here:
+# episodes/epN/tts|audio|video|thumbnails + shot images/scene boards.
+episodes/
+
+# State tracking
+.episode_counter
+.used_articles.json
+.rejected_articles.json
+.resume_state.json
+.resume_state.json.bak
+.resume_state.ep*.json
+.resume_state.ep*.json.bak
+narration_plan.json
+
+# Test / debug artifacts
+zoom_frames_*/
+marker_frames_*/
+m2_*/
+cd_frames_*/
+test_output/
+# Standalone test scripts (keep them local, don't commit)
+test_*.py
+mini_test.py
+reconstruct_*.py
+_music_pipeline_test.py
+
+# Logs + ad-hoc local audio
+*.log
+song_*.wav
+
+# Voice clone backup refs (large, local-only)
+voice_refs/_clone_src/
+voice_refs/*.bak_old
+voice_refs/*.bak_prev
+
+# Trend toolkit cache
+trend_scan_cache.json
+
+# Real-person likeness photos (privacy/copyright - never commit)
+cast_refs/real/
+
+# Generated brand assets (hacker screens / buildings - cached, re-downloaded)
+# NOTE: cast_refs/logos/ PNGs ARE committed (pre-mapped 1000+ brand logos).
+image-assets/
+
+# Heavy runtime audio assets - project-local (voice clones + SFX library).
+# Sourced from the Split Node / Crayon Diet projects; not tracked in git.
+cinematic_sounds/
+voice_refs/
