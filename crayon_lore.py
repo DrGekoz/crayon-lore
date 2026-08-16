@@ -2617,13 +2617,22 @@ def _llm_chat(messages: list[dict], max_tokens: int = 2000, temp: float = 0.8) -
     }).encode()
     req = urllib.request.Request(LM_STUDIO_URL, data=data,
                                  headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            result = json.loads(r.read())
-        return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"  [LLM error] {e}")
-        return ""
+    # Bumped timeout 180s -> 420s + one retry (Joe 2026-08-16): when the codex
+    # imagegen pool / upscaler is running on the SAME GPU, LM Studio inference
+    # crawls and a 2000-token shot prompt can exceed 180s. A short timeout that
+    # aborts mid-generation makes every shot cascade into a slow retry/fallback.
+    last_err = ""
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=420) as r:
+                result = json.loads(r.read())
+            return result["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            last_err = str(e)
+            if attempt == 1:
+                print(f"  [LLM error] {e} - retrying once (GPU contention?)")
+    print(f"  [LLM error] {last_err}")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -2760,6 +2769,17 @@ def _codex_script_chat(messages: list[dict], max_tokens: int = 2000, temp: float
     on stdin via a temp file (the ep014 PowerShell arg-length fix), same as the
     image path in providers.py. We read ONLY stdout so codex's own chat framing
     never pollutes the narration/shot text.
+
+    Per-call CODEX_HOME isolation (Joe 2026-08-16): each script call runs in
+    its OWN fresh CODEX_HOME (auth.json + config.toml copied in), exactly like
+    providers.py Codex.generate_image. When the imagegen pool (isolated homes)
+    runs CONCURRENTLY with a script call on the SHARED ~/.codex, codex exec
+    instances contend on the same session/state and script calls fail rc=1 with
+    empty stdout -> they'd fall back to a GPU-starved LM Studio and time out.
+    Isolation gives the script call its own state namespace so it never contends
+    with the parallel imagegen calls. We also surface stderr on failure (was
+    swallowed) and retry once, so a transient blip doesn't cascade into a slow
+    LM Studio fallback.
     """
     if not _codex_available():
         print("  [CODEX] codex CLI not found on PATH - falling back to LM Studio")
@@ -2771,6 +2791,32 @@ def _codex_script_chat(messages: list[dict], max_tokens: int = 2000, temp: float
     prompt = f"{sys_p}\n\n{user_p}".strip() if sys_p else user_p
     if not prompt:
         return ""
+
+    # Per-call CODEX_HOME isolation (mirrors providers.py generate_image).
+    _user_home = Path.home() / ".codex"
+    _home = None
+    _env = dict(os.environ)
+    try:
+        _home = Path(tempfile.gettempdir()) / f"codex_script_home_{uuid.uuid4().hex[:12]}"
+        _home.mkdir(parents=True, exist_ok=True)
+        for _f in ("auth.json", "config.toml"):
+            _src = _user_home / _f
+            if _src.is_file():
+                try:
+                    shutil.copy2(_src, _home / _f)
+                except Exception:
+                    pass
+        _env["CODEX_HOME"] = str(_home)
+    except Exception:
+        _home = None
+
+    def _cleanup_home():
+        if _home and _home.is_dir():
+            try:
+                shutil.rmtree(_home, ignore_errors=True)
+            except Exception:
+                pass
+
     _tmp = None
     try:
         _tmp = os.path.join(tempfile.gettempdir(),
@@ -2779,36 +2825,51 @@ def _codex_script_chat(messages: list[dict], max_tokens: int = 2000, temp: float
             _f.write(prompt)
     except Exception as _e:
         print(f"  [CODEX] could not write prompt temp file: {_e}")
+        _cleanup_home()
         return ""
     ps_cmd = (f"Get-Content -Raw '{_tmp}' | codex exec --skip-git-repo-check "
               f"-c 'model=\"{CODEX_SCRIPT_MODEL}\"' "
               f"-c 'model_reasoning_effort=\"{CODEX_SCRIPT_EFFORT}\"'")
     cmd = ["powershell.exe", "-NoProfile", "-Command", ps_cmd]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=300)
-    except subprocess.TimeoutExpired:
-        print(f"  [CODEX] timed out writing script ({CODEX_SCRIPT_MODEL})")
+
+    # One retry for a transient codex failure so we don't cascade into a slow
+    # LM Studio fallback on a single blip. Timeout bumped to 420s for long shots.
+    last_err = ""
+    for attempt in (1, 2):
         try:
-            os.remove(_tmp)
-        except Exception:
-            pass
-        return ""
-    try:
-        os.remove(_tmp)
-    except Exception:
-        pass
-    if proc.returncode != 0 and not proc.stdout.strip():
-        print(f"  [CODEX] script call failed (rc={proc.returncode}) - falling back to LM Studio")
-        return ""
-    out = (proc.stdout or "").strip()
-    # Strip any markdown code fences the model may wrap the answer in.
-    out = re.sub(r"^```[a-zA-Z]*\s*", "", out)
-    out = re.sub(r"\s*```$", "", out).strip()
-    if not out:
-        print("  [CODEX] empty script output - falling back to LM Studio")
-        return ""
-    return out
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=420, env=_env)
+        except subprocess.TimeoutExpired:
+            print(f"  [CODEX] timed out writing script ({CODEX_SCRIPT_MODEL}, "
+                  f"attempt {attempt}/2)")
+            last_err = "timeout"
+            continue
+        finally:
+            try:
+                os.remove(_tmp)
+            except Exception:
+                pass
+        out = (proc.stdout or "").strip()
+        if proc.returncode == 0 and out:
+            # Strip any markdown code fences the model may wrap the answer in.
+            out = re.sub(r"^```[a-zA-Z]*\s*", "", out)
+            out = re.sub(r"\s*```$", "", out).strip()
+            if out:
+                _cleanup_home()
+                return out
+            last_err = "empty output after fence strip"
+        else:
+            last_err = (f"rc={proc.returncode} "
+                        f"err={(proc.stderr or '').strip()[:200]!r}")
+        if attempt == 1:
+            print(f"  [CODEX] script call failed ({last_err}) - retrying once...")
+    _cleanup_home()
+    print(f"  [CODEX] script call failed ({last_err}) - falling back to LM Studio")
+    return ""
+
+
+
+
 
 
 def _script_chat(messages: list[dict], max_tokens: int = 2000, temp: float = 0.8) -> str:
@@ -6208,21 +6269,44 @@ def _character_sheet_from_archetype(arch: dict, name: str, role: str = "") -> di
 # archetype roster) and that sheet is reused consistently across the episode.
 CRAYON_DIET_DIR = PROJECT_DIR / "cast_refs" / "crayon_diet"
 _CRAYON_DIET_RELS = {
-    "duck pope": "duck_pope.png",
-    "broccolini biceps": "broccolini_biceps.png",
-    "big tony": "big_tony.png",
-    "big tony mozarella": "big_tony.png",
-    "big tony mozzarella": "big_tony.png",
-    "bro tech": "bro_tech.png",
-    "brotech": "bro_tech.png",
-    "bro-tech": "bro_tech.png",
-    "skibidi sarah": "skibidi_sarah.png",
+    "duck pope": "duck_pope_single.png",
+    "broccolini biceps": "broccolini_biceps_single.png",
+    "big tony": "big_tony_single.png",
+    "big tony mozarella": "big_tony_single.png",
+    "big tony mozzarella": "big_tony_single.png",
+    "bro tech": "bro_tech_single.png",
+    "brotech": "bro_tech_single.png",
+    "bro-tech": "bro_tech_single.png",
+    "skibidi sarah": "skibidi_sarah_single.png",
 }
 _CRAYON_DIET_ALIAS = {
     "duck": "duck pope", "pope": "duck pope",
     "broccoli": "broccolini biceps", "biceps": "broccolini biceps",
     "tony": "big tony", "mozarella": "big tony", "mozzarella": "big tony",
     "bro": "bro tech", "skibidi": "skibidi sarah", "sarah": "skibidi sarah",
+}
+
+# Young-version refs (Joe 2026-08-16): characters that appear as their younger
+# self in the lore use a dedicated de-aged ref generated from the adult cast
+# image, instead of the adult bot image. Checked FIRST in _crayon_diet_ref
+# (before canonicalisation) so 'Tonio' / 'the boy' -> tonio.png, 'young Duck' /
+# 'the duckling' -> duck_young.png, 'young Bro-Tech' / 'the kid' ->
+# bro_tech_young.png - while the adult 'Big Tony' / 'Duck Pope' / 'Bro-Tech'
+# keep their normal cast refs.
+_YOUNG_CHARACTER_RELS = {
+    "tonio": "tonio.png",
+    "young tony": "tonio.png",
+    "young big tony": "tonio.png",
+    "the boy": "tonio.png",
+    "duckling": "duck_young.png",
+    "the duckling": "duck_young.png",
+    "young duck": "duck_young.png",
+    "young duck pope": "duck_young.png",
+    "young bro tech": "bro_tech_young.png",
+    "young bro-tech": "bro_tech_young.png",
+    "young brotech": "bro_tech_young.png",
+    "kid bro tech": "bro_tech_young.png",
+    "the kid": "bro_tech_young.png",
 }
 
 # ---------------------------------------------------------------------------
@@ -6282,6 +6366,13 @@ _CHARACTER_ALIASES = {
     ],
 }
 
+# Distinct non-cast lore characters (Joe 2026-08-16): canonical names that are
+# NOT one of the 5 Crayon Diet cast bots. They keep their OWN generated
+# sheet/ref and must never be folded into a main-cast bot image via the token
+# alias fallback in _crayon_diet_ref (e.g. 'Rat Pope' token 'pope' -> Duck Pope,
+# 'the old don' token 'tony' -> Big Tony).
+_DISTINCT_LORE_CHARS = {k.lower() for k in _CHARACTER_ALIASES} - set(_CRAYON_DIET_RELS)
+
 
 def _char_safe(name: str) -> str:
     """Lowercase alnum-underscore filename token for a character name."""
@@ -6315,15 +6406,43 @@ def _crayon_diet_ref(char_name: str) -> Optional[str]:
     canonical portrait was persisted to cast_refs/crayon_diet in a previous
     episode (e.g. darrel.png / margaret.png) is reused here - never regenerated.
     Returns None if no ref exists yet."""
-    n = _canonical_character_name(char_name).lower()
+    canon = _canonical_character_name(char_name)
+    n = canon.lower()
     if not n:
         return None
+    # Young-version override (Joe 2026-08-16): check the raw mention against
+    # the de-aged refs BEFORE canonicalisation, so 'Tonio' / 'the boy' map to
+    # tonio.png (not the adult big_tony.png), 'duckling' / 'the duckling' /
+    # 'young Duck' -> duck_young.png, 'young Bro-Tech' -> bro_tech_young.png.
+    # Bare 'Duck' (the adult protagonist) is intentionally NOT here - it falls
+    # through to the adult Duck Pope ref (duck_pope_single.png). Exact match
+    # first, then multi-word phrase substrings only - a bare token must NEVER
+    # hijack an adult name (e.g. 'duck' must not swallow 'Duck Pope'). Falls
+    # through to the adult ref (graceful) if the young ref file isn't on disk yet.
+    raw = (char_name or "").strip().lower()
+    if raw in _YOUNG_CHARACTER_RELS:
+        yp = CRAYON_DIET_DIR / _YOUNG_CHARACTER_RELS[raw]
+        if yp.is_file():
+            return str(yp)
+    for yk, yrel in _YOUNG_CHARACTER_RELS.items():
+        if yk == raw or " " not in yk or len(yk) < 4:
+            continue
+        if yk in raw:
+            yp = CRAYON_DIET_DIR / yrel
+            if yp.is_file():
+                return str(yp)
+            break
     rel = _CRAYON_DIET_RELS.get(n)
-    if rel is None:
+    # Distinct non-cast lore characters (Errol, Nonna Rosa, Cormac, Rat Pope,
+    # ...) must keep their OWN generated sheet/ref - never be folded into a
+    # main-cast bot image via the token alias fallback (e.g. 'Rat Pope' token
+    # 'pope' -> Duck Pope, 'the old don' token 'tony' -> Big Tony). Only the
+    # main Crayon Diet cast (and their aliases) go through the token loop.
+    if rel is None and canon.lower() not in _DISTINCT_LORE_CHARS:
         for token in n.split():
-            canon = _CRAYON_DIET_ALIAS.get(token)
-            if canon:
-                rel = _CRAYON_DIET_RELS[canon]
+            _c = _CRAYON_DIET_ALIAS.get(token)
+            if _c:
+                rel = _CRAYON_DIET_RELS[_c]
                 break
     if rel is None:
         # Persisted new-character ref cached from a previous episode - reuse it
