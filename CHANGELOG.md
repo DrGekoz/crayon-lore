@@ -2,6 +2,13 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.8] - 2026-08-16
+
+### Fix: generate a character portrait for every character missing an image ref
+
+- On the codex backend Crayon Lore was skipping the character-sheet build (an assumption inherited from Split Node, which uses real-person photos on codex). Crayon Lore uses generated canonical single portraits, so every non-Crayon-Diet character ended up with no image ref and their shots rendered with no character portrait.
+- Character sheets (one canonical portrait per character) are now ALWAYS built, on every backend, in both the fresh and resume paths, so shots reuse the portrait. Joe 2026-08-16.
+
 ## [1.0.7] - 2026-08-16
 
 ### Fix: codex batch image grabbing under parallelism

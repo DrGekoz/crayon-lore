@@ -9465,21 +9465,18 @@ def _generate_all_shots(shots: list[dict], character_sheets: Optional[dict] = No
     print(f"\n[IMAGES] Generating {len(shots)} 3D shots via {backend_label} "
           f"({len(shots)} -> FaceUpDAT to output resolution)...")
     # ---- PANELS FIRST (dedicated pass) ----
-    # Generate EVERY character's six identity panels up front, before any shot
+    # Generate every character's identity panel/ref up front, before any shot
     # renders. A face-panel failure is retried and resolved here so it can't
     # cascade into every shot missing a face.
-    # CODE-X (Joe 2026-08-09): skip panel generation entirely - codex shots use
-    # each person's REAL photo directly as the identity ref (_select_shot_refs),
-    # not the generated Krea identity panels (they render weird through
-    # gpt-image-2). The character_sheets dict is still used for prompt text.
+    # Crayon Lore (Joe 2026-08-16): ALWAYS build character sheets, even on the
+    # codex backend. Crayon Lore uses generated canonical single portraits (no
+    # real-person photos), so the inherited codex skip left every non-Crayon-Diet
+    # character without an image ref and shots rendered with no portrait.
     sheets: dict[str, dict] = {}
-    if face_lock and sheets_dir and backend != "codex":
+    if face_lock and sheets_dir:
         sheets = _build_all_character_sheets(
             shots, character_sheets, sheets_dir, 70000 + episode_num,
             sheets_cache=sheets)
-    elif backend == "codex":
-        print("  [SHEET] codex backend: using REAL-PERSON photo refs, "
-              "skipping generated character panels")
 
     # ---- SHOT-PROMPT VERIFICATION DEFINITIONS (used by cards + chunked render) ----
     from concurrent.futures import ThreadPoolExecutor as _TPE
@@ -13039,16 +13036,14 @@ def _resume_episode(state: dict) -> None:
         # shot renders. A face-panel failure is retried here and resolved here,
         # so it can't cascade into every shot missing a face (a lazy in-loop
         # build would leave sheets empty across all shots on a hiccup).
-        # CODE-X (Joe 2026-08-09): skip panel generation on resume too - codex
-        # shots use each person's REAL photo directly as the identity ref, so
-        # panels are wasted work (and can leak into codex output detection).
-        if face_lock and _active_image_backend() != "codex":
+        # Crayon Lore (Joe 2026-08-16): always build character sheets, even on
+        # the codex backend - Crayon Lore uses generated canonical single
+        # portraits (no real-person photos), so the inherited codex skip left
+        # chars with no image ref on resume.
+        if face_lock:
             sheets_cache = _build_all_character_sheets(
                 missing_img, character_sheets, sheets_dir, 70000 + episode_num,
                 sheets_cache=sheets_cache)
-        elif face_lock:
-            print("  [SHEET] codex backend: using REAL-PERSON photo refs, "
-                  "skipping generated character panels (resume)")
         # ---- Smart shot regen (matches the fresh loop, PARALLEL on cloud/codex) ----
         # Each character's SIX individual 1280x1280 panels are built once and
         # _select_shot_refs picks the PERFECT panel(s) per shot (framing,
@@ -13076,7 +13071,7 @@ def _resume_episode(state: dict) -> None:
                 # LLM relevance gate (Joe 2026-08-09): cross-check the prompt against
                 # the article topic; rewrite the scene + rebuild if it drifted off-story.
                 prompt = _ensure_shot_prompt_relevant(prompt, shot, character_sheets, _plock, topic)
-            if face_lock and _active_image_backend() != "codex":
+            if face_lock:
                 # Panels were built up front by _build_all_character_sheets -
                 # just confirm every char in this shot is present.
                 for ch in chars:
