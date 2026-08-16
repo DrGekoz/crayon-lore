@@ -2,6 +2,12 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.7] - 2026-08-16
+
+### Fix: codex batch image grabbing under parallelism
+
+- Each codex image call now runs in its OWN isolated `CODEX_HOME`, so its output lands in a unique `generated_images/` namespace. Under 5-way parallel generation the shared `~/.codex/generated_images` got several fresh uuid dirs at once and the grab couldn't tell which belonged to which call (so ~half of batched gens failed to claim and were retried). Isolation makes grabbing deterministic - each call's dir holds exactly one new image. Joe 2026-08-16.
+
 ## [1.0.6] - 2026-08-16
 
 ### Arcane style simplified
