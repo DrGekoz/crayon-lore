@@ -7898,6 +7898,19 @@ AI_ORGS: dict[str, tuple[list[str], str]] = {
     "Amazon":       (["amazon q", "amazon ai", "alexa"], "Amazon AI logo"),
     "NVIDIA":       (["nvidia", "cuda"], "NVIDIA logo"),
     "Adobe":        (["adobe firefly", "firefly ai"], "Adobe Firefly logo"),
+    # Fictional lore brand (Joe 2026-08-16): the Union of the Peking Duck is the
+    # central religion of the Crayon Lore universe. Duck Pope is its supreme
+    # pontiff. Its "logo" is a FULL SCENE (the interior of the Sacred Church of
+    # the Peking Duck, "Scan to Tithe" tithing stand with a Bitcoin logo, and
+    # "The Duck Is Eternal" messaging), so any shot that mentions the Union /
+    # church / Duck Pope attaches this scene as its image ref.
+    "Union of the Peking Duck": (
+        ["union of the peking duck", "peking duck union", "the union of the "
+         "peking duck", "peking duck", "duck pope", "the duck pope",
+         "sacred church of the peking duck", "church of the peking duck",
+         "sacred church", "the sacred church", "the duck is eternal",
+         "duck is eternal", "scan to tithe", "union of the duck"],
+        "Union of the Peking Duck church interior logo"),
 }
 
 # Runtime registry of ALL known brand display names (AI orgs + LLM-extracted
@@ -9198,11 +9211,14 @@ def _llm_shot_ref_check(shot: dict, brand_assets: Optional[dict] = None,
     # LLM can only pick something we can actually attach, and we never trigger
     # a network logo search inside the ref-check - only reuse on-disk assets).
     brand_names = []
-    if brand_assets:
-        for nm in list(_KNOWN_BRANDS) + list(brand_assets):
-            _logo = BRAND_LOGO_DIR / f"{_brand_safe(nm)}.png"
-            if _logo.is_file():
-                brand_names.append(nm)
+    # Always scan every known brand's cached LOGO file (independent of whether
+    # brand_assets is empty) so any brand with a logo on disk is attachable -
+    # e.g. the Union of the Peking Duck, which has only a logo (no screen/
+    # building asset) and must be detected even when no other brand was seen.
+    for nm in list(_KNOWN_BRANDS) + list(brand_assets or {}):
+        _logo = BRAND_LOGO_DIR / f"{_brand_safe(nm)}.png"
+        if _logo.is_file():
+            brand_names.append(nm)
     char_names = [c["name"] for c in _parse_shot_characters(shot)]
 
     # FAST PATH (Joe 2026-08-09): a deterministic keyword match first. If the
@@ -9214,6 +9230,15 @@ def _llm_shot_ref_check(shot: dict, brand_assets: Optional[dict] = None,
     for _bn in brand_names:
         if _bn.lower() in low_text:
             fast_brands.append(_bn)
+            continue
+        # Alias match (Joe 2026-08-16): a brand's aliases also trigger it, so
+        # e.g. 'Duck Pope' / 'The Duck is Eternal' / 'Peking Duck' attach the
+        # Union of the Peking Duck church-scene logo, not just the exact name.
+        _ali = AI_ORGS.get(_bn, ([], ""))[0]
+        for _a in _ali:
+            if _a and _a.lower() in low_text:
+                fast_brands.append(_bn)
+                break
     for _cn in char_names:
         if _cn.lower() in low_text:
             fast_chars.append(_cn)
