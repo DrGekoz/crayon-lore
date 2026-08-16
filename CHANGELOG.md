@@ -2,6 +2,14 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.4] - 2026-08-16
+
+### LLM backend selector
+
+- At startup, pick which LLM writes the narration/script: **LM Studio** (lists the currently-loaded models, you choose one) or **Codex** (lists models sorted cheapest-first, you choose one).
+- All narrative LLM calls route through the chosen backend + model (`_script_chat` dispatches to Codex exec or LM Studio). Aux LM Studio calls (relevance scoring, chapter titles, reachability probe) use the chosen local model.
+- Headless/cron runs can set `LLM_PROVIDER` + `LLM_MODEL` env vars to skip the prompt. Joe 2026-08-16.
+
 ## [1.0.3] - 2026-08-16
 
 ### Image-ref / logo hardening
