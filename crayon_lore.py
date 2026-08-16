@@ -2005,6 +2005,34 @@ def _pick_resolvable_story() -> tuple[str, str, list]:
     return ("", "", [])
 
 
+def _extract_md_title(text: str) -> tuple[str, str]:
+    """Extract the Crayon Lore YouTube title from a pasted .md file and strip it
+    from the narration body (Joe 2026-08-16).
+
+    The lore .md files lead with the FULL YouTube title as their first line,
+    e.g. '[Crayon Lore #001] - Origins of the Duck Pope - Part 1...', followed by
+    a blank line and the story. Also handles a leading YAML frontmatter 'title:'
+    or a markdown H1. Returns (title, body_without_title)."""
+    body = text.lstrip("\ufeff \t\r\n")
+    # YAML frontmatter block (robustness - the current lore files don't use it)
+    if body.startswith("---"):
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n?", body, re.S)
+        if m:
+            t = re.search(r"(?im)^\s*title\s*:\s*(.+?)\s*$", m.group(1))
+            if t:
+                return t.group(1).strip().strip('"\'"'), body[m.end():].strip()
+    # markdown H1
+    m = re.match(r"^#\s+(.+?)\s*\n?", body)
+    if m:
+        return m.group(1).strip(), body[m.end():].strip()
+    # first non-empty line as the title (the .md header), stripped from the body
+    lines = body.split("\n")
+    title = lines[0].strip() if lines else ""
+    if title:
+        return title, "\n".join(lines[1:]).strip()
+    return "", body.strip()
+
+
 def _lore_to_article(text: str, source: Optional[str] = None,
                      title: Optional[str] = None) -> tuple[str, str, list]:
     """Split pasted lore into 'article' paragraphs and derive a working title.
@@ -2079,8 +2107,11 @@ def _pick_lore() -> tuple[str, str, list, bool]:
                     print(f"  [WARN] could not read file ({e}) - try again")
                     continue
                 if text:
-                    title = Path(fp).stem.replace("_", " ").replace("-", " ")
-                    _src, _title, _paras = _lore_to_article(text, source=str(fp), title=title)
+                    _title, _body = _extract_md_title(text)
+                    if not _title:
+                        _title = Path(fp).stem.replace("_", " ").replace("-", " ")
+                    _src, _title, _paras = _lore_to_article(_body, source=str(fp), title=_title)
+                    print(f"  [TITLE] {_title}")
                     return (_src, _title, _paras, _ask_rewrite_lore())
             print(f"  [WARN] file not found: {fp} - try again")
             continue
@@ -2098,7 +2129,11 @@ def _pick_lore() -> tuple[str, str, list, bool]:
             try:
                 text = Path(resp).read_text(encoding="utf-8", errors="replace").strip()
                 if text:
-                    _src, _title, _paras = _lore_to_article(text, source=resp, title=Path(resp).stem)
+                    _title, _body = _extract_md_title(text)
+                    if not _title:
+                        _title = Path(resp).stem
+                    _src, _title, _paras = _lore_to_article(_body, source=resp, title=_title)
+                    print(f"  [TITLE] {_title}")
                     return (_src, _title, _paras, _ask_rewrite_lore())
             except Exception:
                 pass
@@ -4454,6 +4489,19 @@ def _detect_speaker(narr: str) -> Optional[str]:
         first = name.split()[0]
         if len(first) >= 4 and re.search(rf"\b{re.escape(first)}\b", low):
             hits.append(name)
+    # Also honour SHORTENED / alternate names via the Crayon Diet alias table
+    # (e.g. "said the Pope" -> Duck Pope, "said Sarah" / "said Skibidi" ->
+    # Skibidi Sarah, "said Tony" -> Big Tony, "said Broccoli"/"Biceps" ->
+    # Broccolini Biceps). Detection previously only matched the full name or
+    # its FIRST token, so a second-token or alternate-spelling name (Pope,
+    # Sarah, Biceps) silently returned None -> fell back to the narrator.
+    # Iterate the alias map and add the canonical name for any alias token
+    # that actually appears in the narration (>=4 chars to avoid matching the
+    # casual word 'bro' inside speech).
+    for _tok, _canon in _CRAYON_VOICE_ALIAS.items():
+        if len(_tok) >= 4 and re.search(rf"\b{re.escape(_tok)}\b", low):
+            if _canon not in hits:
+                hits.append(_canon)
     if not hits:
         return None
 
@@ -12025,64 +12073,27 @@ def _generate_thumbnail(topic: str, output_path: str) -> bool:
 
 def _generate_titles(topic: str, episode_num: int,
                      bible: Optional[dict] = None) -> list[str]:
-    msg = [
-        {"role": "system", "content": (
-            "You are a viral YouTube title generator for 'Crayon Lore' - a channel that "
-            "narrates the backstory and lore of the Crayon Diet universe as a cinematic, "
-            "chaptered story. Write 6 clickbaity titles. "
-            "Use the FERN formula: each title must IMPLICITLY promise the story's "
-            "VISUAL HOOK (the striking thing the viewer will see) and tease the "
-            "DEEPER QUESTION (the 'how did this happen / why' the episode answers) "
-            "without giving it away. Split the 6 across three proven title formulas, "
-            "2 each: (a) curiosity-driven - a mystery or tease the episode answers, "
-            "(b) number-driven - lead with an exact figure/amount from the story, "
-            "(c) outcome-driven - the transformation, the win, or the price paid. "
-            "Do NOT include any episode number or '#XXX' prefix - these are the "
-            "public YouTube titles and must stand alone with just the clickbaity "
-            "text. Keep each under 70 characters. Reference "
-            "the story directly. Return ONLY 6 lines, one title per line, no numbering."
-        )},
-        {"role": "user", "content": (
-            f"Episode #{episode_num:03d}\nTopic: {topic}\n"
-            + (f"VISUAL HOOK: {bible.get('visual_hook','')}\n"
-               f"DEEPER QUESTION: {bible.get('deeper_question','')}\n"
-               if bible and (bible.get('visual_hook') or bible.get('deeper_question')) else "")
-            + "\nWrite 6 titles."
-        )}
-    ]
-    text = _llm_chat(msg, max_tokens=250, temp=0.85)
-    titles = [t.strip() for t in text.split("\n") if t.strip()]
-    result = []
-    for t in titles:
-        # Defensively strip any episode-number prefix the model still emits
-        t = re.sub(r"^#\s*\d+\s*[-:]\s*", "", t.strip())
-        t = re.sub(r"^\d+\s*[-:]\s*", "", t.strip())
-        if t:
-            result.append(t)
-    while len(result) < 6:
-        result.append(f"The {topic[:40]} lore story you never heard")
-    result = result[:6]
-
-    # Score the 3 titles against REAL Google Trends demand + YouTube competition
-    # (trend-research-toolkit: SerpAPI trends + YouTube Data API via Split Node OAuth).
-    if trend_scorer is not None:
-        try:
-            scored = trend_scorer.score_titles(result, creds_fn=_get_youtube_creds)
-            print("  [TREND] title scores (best first):")
-            for s in scored:
-                print(f"    {s['score']:5.1f}  demand={str(s.get('demand')):>5}  "
-                      f"traj={s.get('trajectory','n/a'):>9}  room={str(s.get('room_to_rank')):>5}  {s['title']}")
-            result = [s["title"] for s in scored]
-        except Exception as e:
-            print(f"  [TREND] title scoring failed: {e}")
-    return result
+    """Crayon Lore titles come from the pasted .md file's header line - the FULL
+    YouTube title, e.g. '[Crayon Lore #001] - Origins of the Duck Pope...'. No
+    LLM generation (Joe 2026-08-16). Return the header/topic verbatim so the
+    upload uses exactly what Joe wrote."""
+    base = (topic or "").strip()
+    if not base:
+        base = f"Crayon Lore #{int(episode_num):03d}"
+    return [base]
 
 
 def _final_title(titles, topic, episode_num):
-    """Crayon Lore episode title: '[Crayon Lore #NNN] - <clickbait>'.
-    Prefixed so every upload starts the episode counter from [Crayon Lore #001]."""
-    base = (titles[0] if titles else f"{topic[:60]}")
-    return f"[Crayon Lore #{int(episode_num):03d}] - {base}"
+    """Crayon Lore episode title. When the pasted .md header already carries the
+    '[Crayon Lore #NNN] - ' prefix (the normal case), use it VERBATIM as the
+    YouTube title. Otherwise add the prefix. Capped at 100 chars (YouTube
+    limit) - Joe keeps headers within it."""
+    base = ((titles[0] if titles else "") or (topic or "") or "").strip()
+    if not base:
+        base = f"Crayon Lore #{int(episode_num):03d}"
+    if re.match(r"^\[Crayon Lore #\d", base, re.I):
+        return base[:100]  # .md header already has the prefix - use verbatim
+    return f"[Crayon Lore #{int(episode_num):03d}] - {base}"[:100]
 
 
 DESCRIPTION_SYSTEM_PROMPT = (
@@ -14211,10 +14222,11 @@ def _episode_setup(default_ep: int):
     except ValueError:
         print(f"  [WARN] '{resp}' not a number, using {default_ep}")
         episode_num = default_ep
-    print(f"\n  Episode #{episode_num:03d}")
+    print(f"\n  Episode #{episode_num:03d}\n")
 
-    target_paras = _ask_paragraph_target()
-    print(f"  [LENGTH] Target {target_paras} narration paragraphs\n")
+    # Crayon Lore does NOT ask for video length (Joe 2026-08-16): the length is
+    # whatever the pasted .md / lore is. Target = 1 narration paragraph per
+    # article paragraph, set right after the source is picked below.
 
     res = _ask_resolution()
     os.environ["RESOLUTION"] = res
@@ -14276,6 +14288,11 @@ def _episode_setup(default_ep: int):
         print("  [HALT] No story found (no lore pasted / could not resolve a URL).")
         return None
     is_lore = article_url.startswith("lore://") or article_url.lower().endswith((".md", ".txt"))
+    # No length prompt (Joe 2026-08-16): target = 1 narration paragraph per
+    # article paragraph; whatever the pasted content is, the video length is.
+    target_paras = max(len(article_paras), 1)
+    print(f"  [LENGTH] Target {target_paras} narration paragraphs "
+          f"(1 per article paragraph, no length prompt)\n")
 
     return {
         "episode_num": episode_num,
