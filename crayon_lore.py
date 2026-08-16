@@ -174,6 +174,22 @@ _CRAYON_VOICE_ALIAS = {
     "broccoli": "broccolini biceps", "biceps": "broccolini biceps",
     "tony": "big tony", "mozarella": "big tony", "mozzarella": "big tony",
     "bro": "bro tech", "skibidi": "skibidi sarah", "sarah": "skibidi sarah",
+    # Duck Pope title aliases (ep 01/01.5/07/09/10).
+    "webbeiness": "duck pope", "waddler": "duck pope", "quacken": "duck pope",
+    "autocorrect": "duck pope", "crisp father": "duck pope",
+    "crispy father": "duck pope",
+    # Young Big Tony (ep 03) - 'tonio' before he becomes Big Tony.
+    "tonio": "big tony", "big cheese": "big tony",
+    # Ep 01/01.5 supporting cast.
+    "errol": "errol", "collector": "errol",
+    "cormac": "cormac", "firebrand": "cormac", "heretic": "cormac",
+    "priya": "priya", "apprentice": "priya",
+    "sven": "sven", "old goose": "sven",
+    # Ep 03 supporting cast.
+    "nonna": "nonna rosa", "rosa": "nonna rosa", "matriarch": "nonna rosa",
+    "salvatore": "salvatore", "old don": "salvatore",
+    # Ep 09/10 factions.
+    "rat pope": "rat pope",
 }
 
 
@@ -6228,6 +6244,41 @@ _CHARACTER_ALIASES = {
         "margaret", "the linguist", "linguist", "margaret the linguist",
         "the translator", "translator", "the language duck", "the duck linguist",
         "the great linguist",
+    ],
+    "Duck Pope": [
+        "duck pope", "the duck pope", "his webbeiness", "the waddler",
+        "the quacken", "the oracle of autocorrect", "the crisp father",
+        "the crispy father", "the great bill",
+    ],
+    "Big Tony Mozarella": [
+        "big tony mozarella", "tonio", "the big mouth", "the big cheese",
+    ],
+    "Errol": [
+        "errol", "the collector", "collector", "the franchisor", "franchisor",
+        "errol the collector", "the man who collected religions",
+    ],
+    "Nonna Rosa": [
+        "nonna rosa", "nonna", "rosa", "the matriarch", "matriarch",
+        "the mozarella matriarch", "grandmother rosa",
+    ],
+    "Salvatore": [
+        "salvatore", "salvatore mozarella", "the old don", "old don",
+        "the old don of the family", "don salvatore",
+    ],
+    "Cormac": [
+        "cormac", "the firebrand", "firebrand", "the heretic", "heretic",
+        "cormac the firebrand", "the once-heretic cormac", "the young firebrand",
+    ],
+    "Priya": [
+        "priya", "the first apprentice", "first apprentice",
+        "priya the first apprentice",
+    ],
+    "Sven": [
+        "sven", "sven the goose", "the old goose", "old goose",
+        "the suspicious goose",
+    ],
+    "Rat Pope": [
+        "rat pope", "the rat pope", "the rat pope of the sewer", "pope of the rats",
     ],
 }
 
