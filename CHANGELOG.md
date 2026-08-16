@@ -2,6 +2,17 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.9] - 2026-08-16
+
+### Fix: character sheets keep native aspect (no upscale crop) + resume reconciliation + API-backend batch overlap
+
+- Character sheets (the one canonical portrait per character) no longer get upscaled to the square `CHAR_PANEL_W/H` target. codex's native landscape output was being cover-cropped to square by `ImageOps.fit` during the async upscale, lopping off the full-body framing. The single portrait now keeps codex's native aspect (`upscale=False`) - it's an identity ref for shots, not a final frame, so any aspect is fine and upscaling is unnecessary. Joe 2026-08-16.
+- Resume now reconciles chapter cards against the deterministic `chapter_XX_slug.png` on disk (new `_reconcile_chapter_card`, mirroring the existing `_reconcile_shot_image`), so an already-generated card is picked up instead of regenerated when the stored path is stale/missing. Applies to the resume `_chap_missing` detection AND the pre-render validation pass. Joe 2026-08-16.
+- Resume's shot `missing_img` already reconciled against disk; the chapter-card path now matches.
+- API backends (codex/fal/runpod) no longer block the batch loop on the next chunk's LLM pre-verify. The async upscale queue already overlaps generation, so the only thing that was stalling the next batch was the verify; it now runs in the background and shots fall back to an inline relevance gate when their verified prompt isn't ready. Local (ComfyUI) still waits, since its upscale runs in the workflow anyway. Joe 2026-08-16.
+- runpod and fal now enqueue the same async upscale as codex (`enqueue_upscale` on success), so all three API backends enforce target resolution without blocking the shot loop. Joe 2026-08-16.
+- Resume menu gained a dedicated "Regenerate CHAPTER CARD images (overwrite)?" question (sets `REGEN_CHAPTERS=1`) separate from the all-shots regen, so you can rebuild just the cards. Joe 2026-08-16.
+
 ## [1.0.8] - 2026-08-16
 
 ### Fix: generate a character portrait for every character missing an image ref
