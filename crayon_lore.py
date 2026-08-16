@@ -277,11 +277,90 @@ def _register_bible_characters(bible: dict) -> None:
         if name:
             _CHAR_GENDER[name.lower()] = str(c.get("gender") or "male").lower()
             _CHAR_ROLE[name.lower()] = str(c.get("role") or "")
+            # New characters get auto-generated aliases so their quoted
+            # dialogue is recognised under a shortened / alternate name.
+            register_character_aliases(
+                name,
+                aliases=c.get("aliases") or [],
+                gender=str(c.get("gender") or "male").lower(),
+                role=str(c.get("role") or ""),
+            )
     prot = (bible or {}).get("protagonist") or {}
     pname = str(prot.get("name", "")).strip()
     if pname:
         _CHAR_GENDER[pname.lower()] = str(prot.get("gender") or "male").lower()
         _CHAR_ROLE[pname.lower()] = str(prot.get("role") or "")
+        register_character_aliases(
+            pname,
+            aliases=prot.get("aliases") or [],
+            gender=str(prot.get("gender") or "male").lower(),
+            role=str(prot.get("role") or ""),
+        )
+
+
+# Title / filler words dropped when auto-deriving a short alias from a full
+# character name (so "the Duck Pope" -> "pope", "Professor Quackington" ->
+# "professor" + "quackington"). Kept small and specific to avoid over-stripping.
+_TITLE_WORDS = {
+    "the", "a", "an", "sir", "madam", "mrs", "ms", "miss", "mr", "dr", "prof",
+    "professor", "saint", "sister", "brother", "father", "mother", "uncle",
+    "aunt", "grandma", "grandpa", "nana", "granny", "queen", "king", "prince",
+    "princess", "lord", "lady", "captain", "general", "sergeant", "mayor",
+    "pope", "holiness", "high", "great", "big", "the duck",
+}
+
+
+def register_character_aliases(
+    name: str,
+    aliases: Optional[list] = None,
+    gender: str = "male",
+    role: str = "",
+) -> None:
+    """Register a character's canonical name + all aliases in the voice router.
+
+    Ensures ANY new character introduced by the story bible gets its short /
+    alternate names mapped to the canonical name, so its quoted dialogue is
+    detected as that character (instead of falling back to the narrator).
+    Call this whenever a new character's name becomes known.
+
+    Auto-derives aliases when none are given:
+      - the full lower-cased name itself
+      - every individual word/token >=4 chars (so "The Duck Pope" -> 'pope',
+        "Broccolini Biceps" -> 'broccolini' + 'biceps')
+      - the name with leading title words stripped ("the duck pope" -> "duck pope")
+    Explicit 'aliases' are always added on top of the derived set.
+    """
+    canonical = (name or "").strip().lower()
+    if not canonical:
+        return
+    if gender in ("female", "male"):
+        _CHAR_GENDER.setdefault(canonical, gender)
+    if role:
+        _CHAR_ROLE.setdefault(canonical, role)
+
+    derived = {canonical}
+    for tok in re.split(r"[\s\-]+", canonical):
+        if len(tok) >= 4:
+            derived.add(tok)
+    # Strip leading title words to catch "the duck pope" / "professor x".
+    stripped = canonical.split()
+    while stripped and stripped[0] in _TITLE_WORDS:
+        stripped = stripped[1:]
+    if stripped:
+        derived.add(" ".join(stripped))
+    for a in (aliases or []):
+        a = str(a).strip().lower()
+        if a:
+            derived.add(a)
+
+    for alias in derived:
+        if alias == canonical:
+            continue
+        # Never clobber an existing alias (5 Crayon Diet cast aliases or a
+        # previously-registered character win).
+        if alias in _CRAYON_VOICE_ALIAS and _CRAYON_VOICE_ALIAS[alias] != canonical:
+            continue
+        _CRAYON_VOICE_ALIAS[alias] = canonical
 
 
 def _gender_for(name: str) -> str:
@@ -359,7 +438,7 @@ def _character_voice(char_name: str) -> Optional[str]:
         for token in n.split():
             canon = _CRAYON_VOICE_ALIAS.get(token)
             if canon:
-                rel = CHARACTER_VOICES[canon]
+                rel = CHARACTER_VOICES.get(canon)  # only CD cast have clones
                 break
     if rel is None:
         return None
@@ -5633,10 +5712,32 @@ def _clean_character_field(raw) -> str:
         m = re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", t)
         return bool(m) and m.group(0).isupper()
     if any(_name_like(t) for t in kept):
-        kept = [t for t in kept if _name_like(t)]
+        # Keep genuine character aliases too even though they read lowercase
+        # (e.g. 'the linguist' -> Margaret, 'the cyber-duck' -> Darrel) so they
+        # aren't mistaken for role descriptors and stripped (Joe 2026-08-16).
+        kept = [t for t in kept if _name_like(t) or _is_known_char_alias(t)]
     if not kept:
         return "NONE"
     return ", ".join(kept)
+
+
+def _is_known_char_alias(t: str) -> bool:
+    """True if a character-field token is a KNOWN lore character or one of its
+    aliases, even when it reads lowercase (e.g. 'the linguist' -> Margaret,
+    'the cyber-duck' -> Darrel). Used by _clean_character_field so real
+    characters are never stripped as if they were role descriptors."""
+    low = (t or "").strip().lower()
+    if not low:
+        return False
+    if low in _CRAYON_DIET_RELS:
+        return True
+    for canon, aliases in _CHARACTER_ALIASES.items():
+        if low == canon.lower() or low in aliases:
+            return True
+    for tok in low.split():
+        if tok in _CRAYON_DIET_ALIAS:
+            return True
+    return False
 
 
 def _character_canonical_map(shots: list[dict]) -> dict[str, str]:
@@ -6108,11 +6209,62 @@ _CRAYON_DIET_ALIAS = {
     "bro": "bro tech", "skibidi": "skibidi sarah", "sarah": "skibidi sarah",
 }
 
+# ---------------------------------------------------------------------------
+# Canonical character aliases (Joe 2026-08-16): ensure the correct character
+# ref / sheet / voice is ALWAYS found by mapping aliases to one canonical name,
+# mirroring the voice-clone alias detection (_character_voice / _CRAYON_VOICE_ALIAS).
+#   - 'the linguist' / 'linguist' / 'Margaret the linguist'  -> Margaret
+#   - 'Darrel the Time-Traveling Duck' / 'the cyber-duck' / 'cyber-duck Darrel' -> Darrel
+# ---------------------------------------------------------------------------
+_CHARACTER_ALIASES = {
+    "Darrel": [
+        "darrel", "darrel the time-traveling duck", "darrel the time traveling duck",
+        "darrel the cyber-duck", "darrel the cyber duck", "cyber-duck darrel",
+        "the time-traveling duck", "the time traveling duck", "the cyber-duck",
+        "the cyber duck", "cybernetic duck", "the cybernetic duck", "cyber duck",
+        "darrel the duck",
+    ],
+    "Margaret": [
+        "margaret", "the linguist", "linguist", "margaret the linguist",
+        "the translator", "translator", "the language duck", "the duck linguist",
+        "the great linguist",
+    ],
+}
+
+
+def _char_safe(name: str) -> str:
+    """Lowercase alnum-underscore filename token for a character name."""
+    return re.sub(r"[^A-Za-z0-9]+", "_", (name or "").lower()).strip("_") or "char"
+
+
+def _canonical_character_name(name: str) -> str:
+    """Map any character mention to its canonical lore name so the right ref,
+    sheet and voice are always found (e.g. 'the linguist' -> 'Margaret', 'the
+    cyber-duck' / 'Darrel the Time-Traveling Duck' -> 'Darrel'). Falls back to
+    the cleaned input when unknown."""
+    n = (name or "").strip()
+    if not n:
+        return n
+    low = n.lower()
+    for canon, aliases in _CHARACTER_ALIASES.items():
+        if low == canon.lower() or low in aliases:
+            return canon
+        # token/substring fallback: an alias phrase appearing in the mention
+        # (e.g. 'Darrel the Time-Traveling Duck' contains 'darrel')
+        for a in aliases:
+            if len(a) >= 4 and a in low:
+                return canon
+    return n
+
 
 def _crayon_diet_ref(char_name: str) -> Optional[str]:
     """If the shot's character is a known Crayon Diet character, return the
-    canonical bot image path to use as the identity ref, else None."""
-    n = (char_name or "").strip().lower()
+    canonical bot image path to use as the identity ref. Aliases are canonicalised
+    first (e.g. 'the linguist' -> Margaret), and a NEW character whose single
+    canonical portrait was persisted to cast_refs/crayon_diet in a previous
+    episode (e.g. darrel.png / margaret.png) is reused here - never regenerated.
+    Returns None if no ref exists yet."""
+    n = _canonical_character_name(char_name).lower()
     if not n:
         return None
     rel = _CRAYON_DIET_RELS.get(n)
@@ -6123,6 +6275,30 @@ def _crayon_diet_ref(char_name: str) -> Optional[str]:
                 rel = _CRAYON_DIET_RELS[canon]
                 break
     if rel is None:
+        # Persisted new-character ref cached from a previous episode - reuse it
+        # so future episodes keep the same look. Build candidate safe-names from
+        # the canonical name, its aliases, and the raw mention, then check both
+        # {safe}.png and {safe}_single.png (legacy) - e.g. 'Margaret' must find
+        # the_linguist_single.png and 'Darrel' must find darrel_single.png.
+        safe_names = {_char_safe(n), _char_safe(char_name)}
+        for canon, aliases in _CHARACTER_ALIASES.items():
+            if canon.lower() == n or n in [a.lower() for a in aliases]:
+                safe_names.add(_char_safe(canon))
+                safe_names.update(_char_safe(a) for a in aliases)
+                break
+        for s in sorted(safe_names):
+            for cand in (f"{s}.png", f"{s}_single.png"):
+                p = CRAYON_DIET_DIR / cand
+                if p.is_file():
+                    return str(p)
+        # Broad fallback: any existing portrait whose filename mentions this
+        # character (canonical or alias safe form) - handles legacy/inconsistent
+        # names like the_linguist_single_margaret.png.
+        stems = {s for s in safe_names if len(s) >= 3}
+        for f in CRAYON_DIET_DIR.glob("*.png"):
+            low = f.stem.lower()
+            if any(s in low for s in stems):
+                return str(f)
         return None
     p = CRAYON_DIET_DIR / rel
     return str(p) if p.is_file() else None
@@ -9192,7 +9368,10 @@ def _parse_shot_characters(shot) -> list[dict]:
         if facing not in _FACING_PANEL:
             facing = default_facing if default_facing in _FACING_PANEL else "front"
         if name:
-            out.append({"name": name, "facing": facing})
+            # Canonicalise aliases (Joe 2026-08-16) so 'the linguist' -> Margaret,
+            # 'the cyber-duck' / 'Darrel the Time-Traveling Duck' -> Darrel - one
+            # ref / sheet / voice per character, never two.
+            out.append({"name": _canonical_character_name(name), "facing": facing})
     return out
 
 
@@ -9471,6 +9650,9 @@ def _sheet_for_name(character_sheets: dict, name: str) -> Optional[dict]:
     'Name A, Name B' (e.g. ep8) - the def is reused for whichever person."""
     if not character_sheets:
         return None
+    # Canonicalise aliases first (Joe 2026-08-16) so 'the linguist' finds the
+    # Margaret sheet / 'the cyber-duck' finds the Darrel sheet.
+    name = _canonical_character_name(name)
     v = character_sheets.get(name)
     if isinstance(v, dict):
         return v
@@ -9748,19 +9930,33 @@ def _generate_character_ref_single(char_name: str, sheet: dict, seed: int,
     per new character and return it as the ref for ALL framings/shot types. No
     6-panel sheet, no fixed archetype, no real-photo identity path - pure
     text-to-image from the LLM character sheet so obscure lore characters keep
-    their own look and stay consistent across every shot."""
-    safe = re.sub(r"[^A-Za-z0-9]+", "_", char_name.lower()).strip("_") or "char"
+    their own look and stay consistent across every shot.
+
+    Joe 2026-08-16: the portrait is PERSISTED to cast_refs/crayon_diet/ under
+    the canonical character name (e.g. darrel.png / margaret.png) so it is
+    reused in FUTURE episodes instead of regenerating. A canonical portrait that
+    already exists there is reused immediately."""
+    canon = _canonical_character_name(char_name)
+    safe = _char_safe(canon)
     sheets_dir.mkdir(parents=True, exist_ok=True)
     out = sheets_dir / f"{safe}_single.png"
+    # Reuse the persisted canonical portrait if one exists (single source of
+    # truth across episodes), unless REGEN_IMAGES forces a fresh one.
     _regen = os.environ.get("REGEN_IMAGES", "0").strip().lower() in ("1", "yes", "y", "true")
+    persist = CRAYON_DIET_DIR / f"{safe}_single.png"
+    if persist.is_file() and not _regen:
+        print(f"  [SHEET] {char_name}: reuse persisted canonical ref {persist.name}")
+        return {v: str(persist) for v in CHAR_PANEL_VIEWS}
     if out.is_file() and not _regen:
         print(f"  [SHEET] {char_name}: reuse single canonical ref")
         return {v: str(out) for v in CHAR_PANEL_VIEWS}
-    if _regen and out.is_file():
-        try:
-            os.remove(out)
-        except OSError:
-            pass
+    if _regen and (out.is_file() or persist.is_file()):
+        for _f in (out, persist):
+            try:
+                if _f.is_file():
+                    os.remove(_f)
+            except OSError:
+                pass
     char_block = _character_prompt_block(sheet, "eye-level")
     p = (f"{RENDER_STYLE}. {char_block}. Full body standing facing the camera, "
          f"entire body head to feet, both feet on the ground, arms relaxed at "
@@ -9781,6 +9977,14 @@ def _generate_character_ref_single(char_name: str, sheet: dict, seed: int,
         print(f"  [SHEET] {char_name}: single ref generation failed ({e})")
         ok = False
     if ok and out.is_file() and out.stat().st_size > 1000:
+        # Persist the canonical portrait for reuse in FUTURE episodes.
+        try:
+            CRAYON_DIET_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(out), str(persist))
+            print(f"  [SHEET] {char_name}: persisted canonical ref -> "
+                  f"cast_refs/crayon_diet/{persist.name}")
+        except Exception as e:
+            print(f"  [SHEET] {char_name}: could not persist ref ({e})")
         print(f"  [SHEET] {char_name}: generated single canonical ref")
         return {v: str(out) for v in CHAR_PANEL_VIEWS}
     return {}
