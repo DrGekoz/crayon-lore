@@ -177,6 +177,177 @@ _CRAYON_VOICE_ALIAS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Multi-clone dialogue voices (Joe 2026-08-16)
+#
+# Every named character that SPEAKS gets its OWN voice. The 5 Crayon Diet
+# characters use their real debate-show clones (CHARACTER_VOICES above).
+# Any OTHER character that has quoted dialogue is auto-assigned a default
+# PocketTTS catalog voice matching its gender (female -> female voice,
+# male -> male voice). Sassy / Bob The Builder / Cyclops Kanye clones are
+# also available and are preferred when a character matches their archetype.
+# A voice is NEVER reused for two different characters.
+#
+# _CHAR_VOICE_ASSIGN is persisted to PROJECT_DIR/character_voice_assignments.json
+# so a character keeps the same voice across resume runs and episodes.
+# ---------------------------------------------------------------------------
+_HERMES_VOICE_REFS = Path(r"C:\Users\josep\.hermes\voice-refs")
+
+# Default PocketTTS built-in catalog voices, split by gender (from the
+# pocket_tts utils._ORIGINS_OF_PREDEFINED_VOICES catalog).
+_DEFAULT_FEMALE_VOICES = [
+    "alba", "anna", "vera", "fantine", "eponine", "azelma",
+    "mary", "jane", "eve", "cosette", "caro_davy", "lola", "estelle",
+]
+_DEFAULT_MALE_VOICES = [
+    "marius", "javert", "jean", "charles", "paul", "george", "michael",
+    "bill_boerst", "peter_yearsley", "stuart_bell", "giovanni",
+    "juergen", "rafael",
+]
+
+# Extra clone voices that "match" certain archetypes (Joe 2026-08-16).
+_CLONE_SASSY = str(_HERMES_VOICE_REFS / "sassy.wav")            # female
+_CLONE_BOB = str(_HERMES_VOICE_REFS / "bobthebuilder.wav")       # male
+_CLONE_KANYE = str(_HERMES_VOICE_REFS / "cyclopskanye.wav")      # male
+
+
+def _voice_usable(p: str) -> bool:
+    """Clone paths only usable if the file exists; built-in names always ok."""
+    if ":" in p and ("\\" in p or "/" in p):
+        return os.path.isfile(p)
+    return True
+
+
+def _archetype_voice(name: str, role: str, gender: str) -> Optional[str]:
+    """Return an extra clone (Bob/Kanye/Sassy) if the character matches its
+    archetype, else None. Only returns a voice that exists and isn't taken."""
+    low = f"{name} {role or ''}".lower()
+    if gender == "male":
+        if re.search(r"\b(builder|carpenter|handyman|plumber|tradesman|"
+                     r"mechanic|construction|fixer|worker|handy|renovation|"
+                     r"tradie)\b", low):
+            return _CLONE_BOB if _voice_usable(_CLONE_BOB) else None
+        if re.search(r"\b(rapper|musician|rapper|celebrity|ego|hype|artist|"
+                     r"producer|beat|hip.?hop|druggie|stoner)\b", low):
+            return _CLONE_KANYE if _voice_usable(_CLONE_KANYE) else None
+    else:
+        if re.search(r"\b(spunky|energetic|loud|quirky|aussie|street|mate|"
+                     r"sassy|fiery|wild)\b", low):
+            return _CLONE_SASSY if _voice_usable(_CLONE_SASSY) else None
+    return None
+
+
+# Registry: canonical character name -> resolved voice (clone path or built-in
+# name). Populated lazily + persisted. _CHAR_GENDER/_CHAR_ROLE are populated
+# from the story bible when it is built (see _register_bible_characters).
+_CHAR_VOICE_ASSIGN: dict[str, str] = {}
+_CHAR_GENDER: dict[str, str] = {}
+_CHAR_ROLE: dict[str, str] = {}
+_VOICE_ASSIGN_FILE = PROJECT_DIR / "character_voice_assignments.json"
+
+
+def _load_voice_assignments() -> None:
+    global _CHAR_VOICE_ASSIGN
+    try:
+        if _VOICE_ASSIGN_FILE.is_file():
+            data = json.loads(_VOICE_ASSIGN_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _CHAR_VOICE_ASSIGN = {
+                    str(k): str(v) for k, v in data.items()
+                }
+    except Exception as e:
+        print(f"  [VOICE] could not load character_voice_assignments.json: {e}")
+
+
+def _save_voice_assignments() -> None:
+    try:
+        _VOICE_ASSIGN_FILE.write_text(
+            json.dumps(_CHAR_VOICE_ASSIGN, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception as e:
+        print(f"  [VOICE] could not save character_voice_assignments.json: {e}")
+
+
+def _register_bible_characters(bible: dict) -> None:
+    """Populate the character gender/role maps from the locked STORY BIBLE so
+    unknown characters get a gender-appropriate default voice (and so their
+    role can match a Sassy/Bob/Kanye archetype clone)."""
+    for c in (bible or {}).get("characters") or []:
+        name = str(c.get("name", "")).strip()
+        if name:
+            _CHAR_GENDER[name.lower()] = str(c.get("gender") or "male").lower()
+            _CHAR_ROLE[name.lower()] = str(c.get("role") or "")
+    prot = (bible or {}).get("protagonist") or {}
+    pname = str(prot.get("name", "")).strip()
+    if pname:
+        _CHAR_GENDER[pname.lower()] = str(prot.get("gender") or "male").lower()
+        _CHAR_ROLE[pname.lower()] = str(prot.get("role") or "")
+
+
+def _gender_for(name: str) -> str:
+    """Return 'female' or 'male' for a character name (bible first, then a
+    light heuristic, then male default)."""
+    n = name.lower()
+    if n in _CHAR_GENDER:
+        g = _CHAR_GENDER[n]
+        return g if g in ("male", "female") else "male"
+    # Heuristic: female name signals / vowel-heavy endings.
+    if re.search(r"\b(sarah|mary|anna|jane|eve|mrs|miss|ms|granny|nana|"
+                 r"aunt|sister|queen|princess|wife|girl|woman|lady)\b", n):
+        return "female"
+    if re.search(r"\b(mr|mrs|sir|king|prince|husband|brother|uncle|grandpa|"
+                 r"father|dad|man|guy|boy)\b", n):
+        return "male"
+    return "male"
+
+
+def _resolve_character_voice(name: str) -> Optional[str]:
+    """Resolve the voice for a named character. Order:
+      1) Crayon Diet real clone (if it's one of the 5)
+      2) a persisted assignment (keeps the same voice across runs)
+      3) an archetype-matching Sassy/Bob/Kanye clone
+      4) a default PocketTTS catalog voice matching the character's gender
+     Guarantees no two characters share a voice."""
+    n = (name or "").strip()
+    if not n:
+        return None
+    # 1) Crayon Diet clones (their real debate-show voices).
+    cd = _character_voice(n)
+    if cd:
+        return cd
+    # 2) Already assigned.
+    low = n.lower()
+    if low in _CHAR_VOICE_ASSIGN:
+        v = _CHAR_VOICE_ASSIGN[low]
+        return v if _voice_usable(v) else None
+    gender = _gender_for(n)
+    role = _CHAR_ROLE.get(low, "")
+    # 3) archetype clone (Sassy/Bob/Kanye) if it matches and is free.
+    arch = _archetype_voice(n, role, gender)
+    used = set(_CHAR_VOICE_ASSIGN.values())
+    if arch and arch not in used and _voice_usable(arch):
+        _CHAR_VOICE_ASSIGN[low] = arch
+        _save_voice_assignments()
+        return arch
+    # 4) default PocketTTS catalog voice by gender, first unused.
+    pool = _DEFAULT_FEMALE_VOICES if gender == "female" else _DEFAULT_MALE_VOICES
+    for v in pool:
+        if v not in used:
+            _CHAR_VOICE_ASSIGN[low] = v
+            _save_voice_assignments()
+            return v
+    # Pool exhausted (unlikely) - reuse the least-used default of either gender.
+    for v in _DEFAULT_MALE_VOICES + _DEFAULT_FEMALE_VOICES:
+        if v not in used:
+            _CHAR_VOICE_ASSIGN[low] = v
+            _save_voice_assignments()
+            return v
+    return None
+
+
+_load_voice_assignments()
+
+
 def _character_voice(char_name: str) -> Optional[str]:
     """Return the Crayon Diet voice clone path for a character name (tolerant
     exact + token-alias match), or None if the name isn't a known character."""
@@ -2669,16 +2840,26 @@ NARRATION_SYSTEM_PROMPT = (
     "for the intro sequence only, never in body paragraphs. Do not end "
     "consecutive paragraphs the same way; vary every paragraph's final line. A "
     "body paragraph ends on the fact or the moment, not on a tease.\n\n"
-    "18. CHARACTER DIALOGUE (STRICT, Crayon Lore): whenever the lore has a "
-    "character SPEAKING - the Duck Pope, Broccolini Biceps, Big Tony Mozarella, "
-    "Bro-Tech, or Skibidi Sarah - write their spoken line as quoted dialogue with "
-    "the speaker NAMED in the same sentence, e.g. '\"Quack, and know peace,\" said "
-    "the Duck Pope.' or 'Big Tony slammed the table. \"You call that a round?\"' "
-    "The pipeline routes quoted speech to that character's own voice clone, so "
-    "ALWAYS name the speaker and keep their words in quotes. Never write dialogue "
-    "without naming who says it. Keep the narrator's descriptive voice separate "
-    "from the characters' spoken lines; only the quoted words are the character "
-    "speaking, everything else is narration.\n"
+    "18. CHARACTER DIALOGUE (STRICT, Crayon Lore): dialogue is CORE to the show - "
+    "it is what makes every character distinct. WRITE A LOT OF IT. Whenever ANY "
+    "character from the story is present and has something to say, give them a "
+    "quoted spoken line rather than just describing them. At least one quoted "
+    "exchange belongs in most scenes, and back-and-forth dialogue between two or "
+    "more characters is encouraged - each speaker must be clearly separated into "
+    "its OWN sentence so every line can be routed to its own voice. Known speaking "
+    "cast - the Duck Pope, Broccolini Biceps, Big Tony Mozarella, Bro-Tech, and "
+    "Skibidi Sarah - ALWAYS speak in character, plus any other named character in "
+    "the story should get their own voice too. Format EVERY spoken line as quoted "
+    "dialogue with the speaker NAMED in the same sentence, e.g. '\"Quack, and know "
+    "peace,\" said the Duck Pope.' or 'Big Tony slammed the table. \"You call that "
+    "a round?\"' or 'Skibidi Sarah leaned in. \"And that is how we win.\"' or a "
+    "back-and-forth: '\"You first,\" said Bro-Tech. \"No, after you,\" the Duck Pope "
+    "quacked.' The pipeline routes each quoted sentence to that speaker's OWN voice "
+    "clone, so ALWAYS name the speaker and keep their words in quotes. Never write "
+    "dialogue without naming who says it, and never let two characters' words share "
+    "one quoted sentence (split them so each gets its own sentence). Keep the "
+    "narrator's descriptive voice separate from the characters' spoken lines; only "
+    "the quoted words are the character speaking, everything else is narration.\n"
     "I will give you a block of pasted lore plus story context. Your job: EXPAND "
     "it into a gripping, chaptered story narration. Write in the present tense, cinematic, "
     "dramatic - build suspense, then resolve triumphantly near the end. Keep the "
@@ -4226,28 +4407,117 @@ def _lookup_voice(character: str) -> Optional[str]:
     return _character_voice(character)
 
 
+def _known_speaker_names() -> list[str]:
+    """All character names the dialogue router can recognise (Crayon Diet
+    cast + bible-registered characters + already-assigned voices)."""
+    seen, out = set(), []
+    for name in list(CHARACTER_VOICES.keys()) + \
+                list(_CHAR_GENDER.keys()) + \
+                list(_CHAR_VOICE_ASSIGN.keys()):
+        n = str(name).strip().lower()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _detect_speaker(narr: str) -> Optional[str]:
+    """Return the canonical character name most likely to be the speaker of a
+    quoted line, or None. Prefers an attributed speaker (name near a dialogue
+    verb), then a named character present in the sentence, then the first-name
+    token of a known character."""
+    low = narr.lower()
+    # Find names present in the narration.
+    hits = []
+    for name in _known_speaker_names():
+        # Match the full name, or its first token if the name is multi-word and
+        # the token is distinctive (>=4 chars - avoids 'bro'/'tony' matching the
+        # casual word inside a quote).
+        if name in low:
+            hits.append(name)
+            continue
+        first = name.split()[0]
+        if len(first) >= 4 and re.search(rf"\b{re.escape(first)}\b", low):
+            hits.append(name)
+    if not hits:
+        return None
+
+    # Spans covered by double-quoted speech (contractions/apostrophes use a
+    # single quote, so only treat double quotes as dialogue delimiters).
+    spans = []
+    open_i = None
+    for m in re.finditer(r'"', narr):
+        if open_i is None:
+            open_i = m.start()
+        else:
+            spans.append((open_i, m.start()))
+            open_i = None
+
+    def _in_quote(pos):
+        return any(s <= pos <= e for (s, e) in spans)
+
+    def _name_occs(name):
+        return [m.start() for m in re.finditer(rf"\b{re.escape(name)}\b", low)]
+
+    def _score(name):
+        sc = 0
+        all_occ = _name_occs(name)
+        outside = [p for p in all_occ if not _in_quote(p)]
+        # Verb attribution OUTSIDE quotes: +4 per verb adjacent to the name.
+        for m in re.finditer(
+                r"\b(said|says|asks|asked|shouted|yelled|whispered|muttered|"
+                r"growled|snapped|replied|answered|cried|called|told|screamed|"
+                r"hissed|grinned|laughed|declared|announced|admitted|warned|"
+                r"reminded|slammed|puffed|quacked|demanded|huffed)\b", low):
+            if _in_quote(m.start()):
+                continue  # the verb is spoken text, not an attribution
+            for o in outside:
+                if abs(o - m.start()) <= 14:
+                    sc += 4
+                    break
+        # Name within ~40 chars of a quote mark.
+        for m in re.finditer(r'"', narr):
+            span = low[max(0, m.start() - 40): m.start() + 40]
+            if re.search(rf"\b{re.escape(name)}\b", span):
+                sc += 1
+                break
+        # A name that ONLY ever appears inside quoted speech is content being
+        # talked about, not the speaker - penalise it hard so a real speaker
+        # wins. (e.g. '"I serve the Duck Pope," said Darryl' -> Darryl.)
+        if all_occ and not outside:
+            sc -= 3
+        return sc
+
+    # Pick the highest-scoring speaker (verb attribution outside quotes is the
+    # strongest signal; names only ever quoted get demoted). Tie-break toward a
+    # Crayon Diet character (main cast).
+    best = max(hits, key=lambda n: (_score(n), 1 if n in CHARACTER_VOICES else 0))
+    if _score(best) > 0:
+        return best
+    return hits[0]
+
+
 def _shot_dialogue_voice(shot) -> Optional[str]:
-    """Voice for a shot's narration (Crayon Lore, Joe 2026-08-15): if the
-    sentence is DIALOGUE spoken by a known Crayon Diet character (a quoted line
-    attributed to them), return that character's voice clone; else None so the
-    narrator (intro/story) voice is used. Narration ABOUT a character stays in
-    the narrator voice - only quoted speech routes to a character clone."""
+    """Voice for a shot's narration (Crayon Lore, Joe 2026-08-15/16): if the
+    sentence is DIALOGUE (a quoted line), route it to the SPEAKER's own voice.
+    The 5 Crayon Diet characters use their debate-show clones; any other named
+    character is auto-assigned a gender-matched default PocketTTS voice (or a
+    matching Sassy/Bob/Kanye clone). No two characters ever share a voice.
+    Returns None so narration stays in the narrator (intro/story) voice."""
     narr = (shot.get("narration") or "").strip()
     if not narr:
         return None
     # Only quoted lines count as dialogue (narrator describes in the rest).
     if '"' not in narr and "'" not in narr:
         return None
-    low = narr.lower()
-    # 1) a known Crayon Diet character is named in the quoted sentence
-    for canon in CHARACTER_VOICES:
-        if canon in low:
-            v = _character_voice(canon)
-            if v:
-                return v
-    # 2) the shot's on-screen character is a known Crayon Diet character
+    speaker = _detect_speaker(narr)
+    if speaker:
+        v = _resolve_character_voice(speaker)
+        if v:
+            return v
+    # Fallback: the shot's on-screen character is a known speaking character.
     for ch in _parse_shot_characters(shot):
-        v = _character_voice(ch["name"])
+        v = _resolve_character_voice(ch["name"])
         if v:
             return v
     return None
@@ -10213,6 +10483,110 @@ def _sa3_prompt_triumphant(topic: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-2-paragraph adaptive SA3 music (Joe 2026-08-16)
+# ---------------------------------------------------------------------------
+MUSIC_DEFAULT_BPM = 85
+MUSIC_LLM_MAXWORDS = 40
+
+
+def _llm_music_prompt(story: str) -> str:
+    """Ask the local LLM to write a Stable Audio 3 music prompt for a
+    2-paragraph story beat. The prompt ends with an explicit BPM so the track's
+    tempo matches the scene. Falls back to a neutral underscore on LLM failure."""
+    if not story or not story.strip():
+        return f"Dark cinematic documentary underscore, atmospheric, restrained, {MUSIC_DEFAULT_BPM} BPM"
+    try:
+        text = _llm_chat([
+            {"role": "system", "content": (
+                "You write music prompts for Stable Audio 3, a text-to-music model. "
+                "Given a short story beat (two narration paragraphs), write ONE "
+                "music prompt that matches the scene. Format: a short comma-separated "
+                "list of genre, mood, instruments and energy, ending with the tempo "
+                "as '<N> BPM' (pick a fitting tempo between 60 and 140). One sentence "
+                f"only, under ~{MUSIC_LLM_MAXWORDS} words. No labels, no quotes, no "
+                "intro - just the prompt.")},
+            {"role": "user", "content": story},
+        ], max_tokens=90, temp=0.7).strip().strip('"').strip()
+        if not text:
+            raise ValueError("empty")
+        if not re.search(r"\d+\s*BPM", text, re.I):
+            text = f"{text}, {MUSIC_DEFAULT_BPM} BPM"
+        return text
+    except Exception:
+        return (f"Dark cinematic documentary underscore, atmospheric, "
+                f"restrained, {MUSIC_DEFAULT_BPM} BPM")
+
+
+def _build_adaptive_music_bed(shots: list, clip_starts: list, total_dur: float,
+                              temp_dir: Path, episode_num: int) -> Optional[str]:
+    """Generate one SA3 music segment per 2 narration paragraphs and assemble
+    them into a single bed of total_dur, laid at their voice-timeline windows.
+
+    Returns the assembled bed WAV path (already at MUSIC_DB) or None if SA3 is
+    unavailable or every segment failed (caller falls back to the static pool)."""
+    import sa3_music
+    if not sa3_music.available():
+        print("  [SA3] not ready - using static music pool")
+        return None
+    pairs = []
+    n = len(shots)
+    i = 0
+    while i < n:
+        j = min(i + 2, n)
+        start = clip_starts[i]
+        end = clip_starts[j] if j < n else total_dur
+        dur = max(end - start, 1.0)
+        story = " ".join((s.get("narration") or "").strip() for s in shots[i:j])
+        pairs.append((start, dur, story))
+        i = j
+    seg_paths = []
+    gen_ok = 0
+    total = len(pairs)
+    bar = tqdm(total=total, desc="SA3 music", unit="seg", leave=False) if _HAS_PROGRESS else None
+    for k, (start, dur, story) in enumerate(pairs):
+        prompt = _llm_music_prompt(story)
+        out = temp_dir / f"music_pair_{k:03d}.wav"
+        ok = sa3_music.generate_via_gradio(prompt, dur, str(out), story_context=story)
+        if ok and out.is_file() and out.stat().st_size > 1000:
+            seg_paths.append((str(out), start))
+            gen_ok += 1
+        if bar:
+            bar.update(1)
+            bpm = re.search(r"(\d+)\s*BPM", prompt, re.I)
+            bar.set_postfix(bpm=bpm.group(1) if bpm else "?")
+    if bar:
+        bar.close()
+    if not seg_paths:
+        print(f"  [AUDIO] SA3 adaptive bed: 0/{total} segments generated - using static pool")
+        return None
+    print(f"  [AUDIO] SA3 adaptive bed: {gen_ok}/{total} 2-paragraph segments generated")
+    inputs, fparts, labels = [], [], []
+    for k, (path, start) in enumerate(seg_paths):
+        inputs += ["-i", path]
+        d = int(round(start * 1000))
+        fparts.append(f"[{k}:a]aresample=44100,adelay={d}|{d}[s{k}]")
+        labels.append(f"[s{k}]")
+    fscript = temp_dir / "music_adaptive_filter.txt"
+    fscript.write_text(
+        ";".join(fparts) + ";" + "".join(labels) +
+        f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
+        f"atrim=0:{total_dur:.2f},"
+        f"afade=t=in:st=0:d=0.5,"
+        f"afade=t=out:st={max(total_dur - 0.6, 0):.2f}:d=0.5,"
+        f"volume={MUSIC_DB}dB[out]", encoding="utf-8")
+    music_raw = temp_dir / "music_adaptive.wav"
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error"] + inputs +
+        ["-filter_complex_script", str(fscript), "-map", "[out]",
+         "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", str(music_raw)],
+        capture_output=True, text=True, timeout=300)
+    if r.returncode == 0 and music_raw.is_file() and music_raw.stat().st_size > 1000:
+        return str(music_raw)
+    print(f"  [AUDIO] SA3 adaptive bed assemble failed: {r.stderr[-200:]}")
+    return None
+
+
 def _build_audio_mix(shots: list[dict], episode_num: int,
                      title_events: Optional[list] = None):
     """Build the full audio track: voice (0dB) + music (-19.5dB) + SFX (-15dB hit-aligned).
@@ -10317,28 +10691,18 @@ def _build_audio_mix(shots: list[dict], episode_num: int,
                 if os.environ.get("MUSIC_BACKEND", "sa3").strip().lower() == "sa3":
                     import sa3_music
                     if sa3_music.available():
-                        # Adaptive music: build the story text for each section so
-                        # the prompts reflect what's happening on screen in that
-                        # part of the episode (Joe 2026-08-14).
-                        sus_story = " ".join(
-                            shot.get("narration", "") or ""
-                            for shot, st in zip(valid, clip_starts)
-                            if st < section_cut and shot.get("narration"))
-                        tri_story = " ".join(
-                            shot.get("narration", "") or ""
-                            for shot, st in zip(valid, clip_starts)
-                            if st >= section_cut and shot.get("narration"))
-                        sa3_ok = sa3_music.generate_bed_via_gradio(
-                            _sa3_prompt_suspense(topic),
-                            _sa3_prompt_triumphant(topic),
-                            section_cut, total_dur - section_cut,
-                            str(sus_raw), str(tri_raw),
-                            story_suspense=sus_story, story_triumphant=tri_story)
-                        if sa3_ok:
-                            print(f"  [AUDIO] Music: STABLE AUDIO 3 bed (resident model, "
-                                  f"story-adaptive) - "
-                                  f"suspense 0-{section_cut:.0f}s crossfade into "
-                                  f"triumphant to {total_dur:.0f}s")
+                        # Per-2-paragraph adaptive bed (Joe 2026-08-16): the music
+                        # matches the story beat by beat instead of one fixed
+                        # suspense->triumphant split.
+                        adap = _build_adaptive_music_bed(
+                            valid, clip_starts, total_dur, temp_dir, episode_num)
+                        if adap:
+                            music_path = adap
+                            sa3_ok = True
+                            print(f"  [AUDIO] Music: SA3 adaptive bed - one track per "
+                                  f"2 narration paragraphs, ducked under voice")
+                        else:
+                            print("  [AUDIO] SA3 adaptive bed failed - static pool fallback")
                     else:
                         print("  [SA3] not ready - using static music pool")
                 if not sa3_ok:
@@ -12498,6 +12862,7 @@ def _rebuild_script_for_resume(state: dict) -> dict:
         return {}
 
     story_bible = _build_story_bible(topic, paragraphs)
+    _register_bible_characters(story_bible)
     narration = _build_narration_script(paragraphs, target_paras, bible=story_bible)
     if narration:
         narration = _rate_paragraph_relevance(topic, narration)
@@ -13920,6 +14285,7 @@ def _phase_llm(config: dict):
 
     print("\n[BIBLE] Building story bible from the article (before script)...")
     story_bible = _build_story_bible(topic, paragraphs)
+    _register_bible_characters(story_bible)
 
     narration = _build_narration_script(paragraphs, target_paras, bible=story_bible)
     if narration and not config.get("is_lore"):
