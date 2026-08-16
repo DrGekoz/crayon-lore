@@ -2,6 +2,13 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.12] - 2026-08-16
+
+### Fix: resume actually picks up pre-existing shots (style change no longer nukes them) + codex startup sandbox
+
+- A style change on resume no longer force-regenerates existing shots. Previously picking a style different from the episode's current one set `REGEN_IMAGES=1` unconditionally, so a resume that should have reused the 50+ already-generated images (reconciled against disk) instead re-rendered ALL of them — overriding your explicit "no" to image regen. Now a style change only forces full re-render if you ALSO opted into image regeneration (`_wants_img_regen`); otherwise resume keeps the existing shots and the new style applies only to genuinely-missing ones. `_reconcile_shot_image` was already correctly matching the on-disk `shotNN_*.png` files; this removes the override that bypassed it. Joe 2026-08-16.
+- Codex startup no longer tries to spawn the elevated Windows sandbox helper. The episode's image/script backend runs `codex exec` which works in the `read-only` / `unelevated` sandbox; the `[windows] sandbox = "elevated"` config was spawning `codex-windows-sandbox-setup.exe` with admin requirements that a non-admin pipeline process can't satisfy ("The specified module could not be found"). Config changed to `unelevated` — imagegen verified still writes output. Joe 2026-08-16.
+
 ## [1.0.11] - 2026-08-16
 
 ### Fix: no stall after the first image batch on resume
