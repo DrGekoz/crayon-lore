@@ -2026,10 +2026,22 @@ def _lore_to_article(text: str, source: Optional[str] = None,
     return (src, title, paras)
 
 
-def _pick_lore() -> tuple[str, str, list]:
+def _ask_rewrite_lore() -> bool:
+    """Ask whether the LLM should RE-WRITE pasted lore into a chaptered
+    narration, or use the pasted script VERBATIM (Joe 2026-08-16). Enter = yes
+    (rewrite), preserving the old behaviour; 'n'/'no' = use the exact text."""
+    try:
+        resp = input("  Do you want to re-write this using LLM? [Y/n]: ").strip().lower()
+    except EOFError:
+        return True
+    return resp not in ("n", "no", "0", "false", "nope", "nah")
+
+
+def _pick_lore() -> tuple[str, str, list, bool]:
     """Crayon Lore topic picker (Joe 2026-08-15): accept a pasted block of lore
-    text, a path to an .md/.txt file, or a URL. Returns (source, title, paras)
-    on success, or ("", "", []) on abort."""
+    text, a path to an .md/.txt file, or a URL. Returns (source, title, paras,
+    rewrite) on success, or ("", "", [], True) on abort. `rewrite` = whether the
+    LLM should re-write the pasted script (True) or use it verbatim (False)."""
     print("\n[STORY] Crayon Lore - pick a source:")
     print("  1. PASTE  - paste a block of lore / backstory text (then a blank line)")
     print("  2. FILE   - paste a path to a .md / .txt file (used as the story)")
@@ -2056,7 +2068,8 @@ def _pick_lore() -> tuple[str, str, list]:
                 print("  [WARN] empty lore - try again")
                 continue
             print(f"  [LORE] parsed {len(_lore_to_article(text)[2])} paragraphs")
-            return _lore_to_article(text)
+            _src, _title, _paras = _lore_to_article(text)
+            return (_src, _title, _paras, _ask_rewrite_lore())
         if resp in ("2", "file", "f"):
             fp = input("  Path to .md / .txt file: ").strip().strip('"')
             if os.path.isfile(fp):
@@ -2067,7 +2080,8 @@ def _pick_lore() -> tuple[str, str, list]:
                     continue
                 if text:
                     title = Path(fp).stem.replace("_", " ").replace("-", " ")
-                    return _lore_to_article(text, source=str(fp), title=title)
+                    _src, _title, _paras = _lore_to_article(text, source=str(fp), title=title)
+                    return (_src, _title, _paras, _ask_rewrite_lore())
             print(f"  [WARN] file not found: {fp} - try again")
             continue
         if resp in ("3", "url", "u"):
@@ -2076,7 +2090,7 @@ def _pick_lore() -> tuple[str, str, list]:
                 title = _fetch_page_title(u)
                 paras = fetch_article_paragraphs(u)
                 if paras:
-                    return (u, title, paras)
+                    return (u, title, paras, _ask_rewrite_lore())
             print("  [WARN] URL did not resolve - try again")
             continue
         # Raw paste that isn't a choice: try as a file path, else as lore text.
@@ -2084,7 +2098,8 @@ def _pick_lore() -> tuple[str, str, list]:
             try:
                 text = Path(resp).read_text(encoding="utf-8", errors="replace").strip()
                 if text:
-                    return _lore_to_article(text, source=resp, title=Path(resp).stem)
+                    _src, _title, _paras = _lore_to_article(text, source=resp, title=Path(resp).stem)
+                    return (_src, _title, _paras, _ask_rewrite_lore())
             except Exception:
                 pass
         print(f"  [WARN] '{resp[:30]}' not a valid choice - enter 1, 2 or 3")
@@ -4507,8 +4522,13 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
     narr = (shot.get("narration") or "").strip()
     if not narr:
         return None
-    # Only quoted lines count as dialogue (narrator describes in the rest).
-    if '"' not in narr and "'" not in narr:
+    # Only DOUBLE-quoted lines count as dialogue (narrator describes in the
+    # rest). Single quotes are almost always apostrophes in English narration
+    # ("Darrel's", "it's"), so checking for them would mis-route plain
+    # narration that merely mentions a character into that character's voice.
+    # The detector (_detect_speaker) also only treats double quotes as
+    # dialogue delimiters, so this guard matches it.
+    if '"' not in narr:
         return None
     speaker = _detect_speaker(narr)
     if speaker:
@@ -14251,7 +14271,7 @@ def _episode_setup(default_ep: int):
     print(f"  [IMAGES] mode: shots={'REGEN' if regen_shots else 'resume'}, "
           f"chapters={'REGEN' if regen_chapters else 'resume'}\n")
 
-    article_url, article_title, article_paras = _pick_lore()
+    article_url, article_title, article_paras, rewrite_lore = _pick_lore()
     if not article_url:
         print("  [HALT] No story found (no lore pasted / could not resolve a URL).")
         return None
@@ -14265,6 +14285,7 @@ def _episode_setup(default_ep: int):
         "article_title": article_title,
         "article_paras": article_paras,
         "is_lore": is_lore,
+        "rewrite_lore": rewrite_lore,
         "thumb_backend": thumb_backend,
         "thumb_model": thumb_model,
         "img_backend": img_backend,
@@ -14312,17 +14333,30 @@ def _phase_llm(config: dict):
     story_bible = _build_story_bible(topic, paragraphs)
     _register_bible_characters(story_bible)
 
-    narration = _build_narration_script(paragraphs, target_paras, bible=story_bible)
-    if narration and not config.get("is_lore"):
-        narration = _rate_paragraph_relevance(topic, narration)
-        if not narration:
-            print("  [FILTER] All narration segments off-topic, rebuilding from filtered article...")
-            narration = _build_narration_script(paragraphs, target_paras, bible=story_bible)
+    # Verbatim mode (Joe 2026-08-16): if the user pasted an article / file and
+    # answered 'no' to "re-write this using LLM?", use the pasted text EXACTLY
+    # as the narration - no LLM paraphrase/expansion, no generated intro. The
+    # structural pipeline (chapters, establishing shots, sentence-level shots)
+    # still applies on top.
+    rewrite = config.get("rewrite_lore")  # None/True = rewrite, False = verbatim
+    if rewrite is False:
+        narration = [p for p in paragraphs if p and p.strip()]
+        print(f"  [SCRIPT] using pasted lore VERBATIM ({len(narration)} paragraphs, no LLM rewrite)")
+    else:
+        narration = _build_narration_script(paragraphs, target_paras, bible=story_bible)
+        if narration and not config.get("is_lore"):
+            narration = _rate_paragraph_relevance(topic, narration)
+            if not narration:
+                print("  [FILTER] All narration segments off-topic, rebuilding from filtered article...")
+                narration = _build_narration_script(paragraphs, target_paras, bible=story_bible)
     narration = _dedupe_consecutive_locations(narration)
     # Intro hook + narration plan (key words + foley) at the PARAGRAPH level,
     # BEFORE chapters are inserted / sentences split (Joe 2026-08-12).
     plan = _plan_narration(narration, episode_num)
-    intro, intro_plan = _generate_intro(paragraphs)
+    if not (rewrite is False):
+        intro, intro_plan = _generate_intro(paragraphs)
+    else:
+        intro, intro_plan = None, None
     if intro:
         narration = list(intro) + narration
         for _ki, _kv in (intro_plan or {}).items():
