@@ -2,6 +2,13 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.11] - 2026-08-16
+
+### Fix: no stall after the first image batch on resume
+
+- The v1.0.9 "don't block the batch loop on the next chunk's LLM verify" change went too far: it removed ALL waiting, so the NEXT chunk's shots rendered before their `_verified_prompt`/`_llm_refs` were set. `_regen_one` then fell back to two inline LLM calls per shot (`_ensure_shot_prompt_relevant` + ref check) across 20 parallel workers, hammering LM Studio into an apparent stall after the first batch.
+- Restored pre-verification with a **two-chunk lookahead**: chunk 0 is verified up front, chunks 1+ are verified in background threads, and each chunk's verify is submitted a full two chunk-renders before that chunk renders - so it is ALWAYS done before the shot fires. `_regen_one` never falls back to inline LLM calls, and each batch proceeds immediately. The async upscale queue still overlaps codex generation (upscale stays in the background via `providers.enqueue_upscale`), which was the real win Joe wanted. Local (ComfyUI) is unchanged (its upscale runs in the workflow). Joe 2026-08-16.
+
 ## [1.0.10] - 2026-08-16
 
 ### Fix: chapter-card regen no longer cascades from a shot regen
