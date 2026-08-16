@@ -1,6 +1,18 @@
 # Changelog
 
-All notable changes to Split Node.
+All notable changes to Crayon Lore.
+
+## [1.0.3] - 2026-08-16
+
+### Image-ref / logo hardening
+
+- `_find_logo` now validates cached logos with PIL and drops corrupt files (e.g. an SVG saved as a .png) so codex never receives an unprocessable ref. Logo downloads from Wikimedia/SerpAPI are rasterized to a real PNG when they come back as SVG (`_coerce_raster_image`).
+- When no real logo exists for an entity (e.g. fictional lore devices like DIXPORD), the pipeline now GENERATES a logo as its own ref through the configured image provider (`_generate_logo_ref`, simple "Generate a logo for <name>" prompt), cached per brand.
+- `providers.py` adds `_ref_is_valid_image()`: every image ref is PIL-verified before it reaches codex; a bad ref is dropped (with a WARN) so the shot still generates txt2img instead of silently breaking codex claiming.
+
+### Repo hygiene
+
+- `cast_refs/` and `episodes/` are no longer tracked in git (copyright/privacy-weighted + large; re-downloaded or generated at runtime). Joe 2026-08-16.
 
 ## [1.53.0] - 2026-08-14
 
