@@ -10783,6 +10783,103 @@ def _normalize_voice_0db(wav_path: str) -> str:
         except: pass
     return wav_path
 
+
+def _split_dialogue_segments(narr: str, char_voice: Optional[str],
+                             narrator_voice: Optional[str]) -> list[tuple[str, Optional[str]]]:
+    """Split ONE narration sentence into (text, voice) sub-segments so a spoken
+    line like:  "Quack, and know peace," said the Duck Pope, and his voice rolled.
+    comes out as TWO TTS clips:
+        ("Quack, and know peace,",  <Duck Pope clone>)   # quoted dialogue
+        ("said the Duck Pope, ...", narrator)            # attribution + narration
+    This keeps "said Margaret" / "she said" etc in the NARRATOR's voice instead of
+    the character clone (Joe 2026-08-17). Detection of WHO speaks is untouched -
+    the caller still passes the clone resolved by _shot_dialogue_voice, so a quote
+    is only treated as dialogue when a speaker was actually detected. Any non-dialogue
+    sentence returns a single narrator segment. Contiguous narrator runs are merged
+    back into one clip so a sentence with one quote yields exactly 2 clips.
+
+    Returns a list of (text, voice) where voice is the clone path or None (narrator).
+    """
+    narr = (narr or "").strip()
+    if not narr:
+        return []
+    # Quoted spans (double-quoted dialogue) get the clone voice; everything else
+    # outside the quotes is the narrator (attribution + surrounding narration).
+    spans = []
+    for m in re.finditer(r'"[^"]*"', narr):
+        spans.append((m.start(), m.end()))
+    if not spans or not char_voice:
+        return [(narr, None)]
+    segs: list[tuple[str, Optional[str]]] = []
+    pos = 0
+    for (s, e) in spans:
+        lead = narr[pos:s].strip()
+        if lead:
+            segs.append((lead, None))        # attribution/narration before the quote
+        segs.append((narr[s:e], char_voice))  # the quoted dialogue
+        pos = e
+    tail = narr[pos:].strip()
+    if tail:
+        segs.append((tail, None))            # attribution/narration after the quote
+    # Merge adjacent narrator segments so one quote -> exactly dialogue + narrator.
+    merged: list[tuple[str, Optional[str]]] = []
+    for text, voice in segs:
+        if not text:
+            continue
+        if voice is None and merged and merged[-1][1] is None:
+            merged[-1] = (merged[-1][0] + " " + text, None)
+        else:
+            merged.append((text, voice))
+    merged = [(t, v) for t, v in merged if t.strip()]
+    return merged if merged else [(narr, None)]
+
+
+def _tts_generate_shot(shot: dict, nidx: int, out_path: str,
+                       char_voice: Optional[str], narrator_voice: Optional[str]) -> bool:
+    """Generate a shot's narration clip, splitting a quoted-dialogue sentence into
+    separate character-clone + narrator segments and concatenating them into ONE
+    wav at out_path (so the audio mix / whisper timing / image sync stay per-shot).
+    char_voice = the detected speaker's clone (None = pure narration); the clone
+    reads only the quoted dialogue, everything else stays in narrator_voice.
+    Returns True on success (out_path is a valid wav)."""
+    text = (shot.get("narration") or "").strip()
+    if not text:
+        return False
+    narrator_voice = narrator_voice or STORY_VOICE
+    segs = _split_dialogue_segments(text, char_voice, narrator_voice)
+    if len(segs) <= 1:
+        v = segs[0][1] if segs else None
+        return _pocket_tts_generate(text, out_path, voice=v or narrator_voice)
+    tmpdir = tempfile.mkdtemp(prefix=f"cl_seg_{nidx}_")
+    parts: list[str] = []
+    try:
+        for i, (seg_text, voice) in enumerate(segs):
+            p = os.path.join(tmpdir, f"seg_{i:02d}.wav")
+            v = voice or narrator_voice
+            if not _pocket_tts_generate(seg_text, p, voice=v):
+                return False
+            _normalize_voice_0db(p)
+            if os.path.isfile(p) and os.path.getsize(p) > 1000:
+                parts.append(p)
+        if not parts:
+            return False
+        lst = os.path.join(tmpdir, "concat.txt")
+        with open(lst, "w") as f:
+            for p in parts:
+                f.write(f"file '{p}'\n")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", lst, "-c:a", "pcm_s16le", out_path],
+            capture_output=True, text=True, timeout=120)
+        return r.returncode == 0 and os.path.isfile(out_path) and \
+            os.path.getsize(out_path) > 1000
+    except Exception as e:
+        print(f"  [TTS] segment concat error {nidx}: {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _tts_worker(narration_paras: list[str], episode_num: int,
                 results: dict, stop: threading.Event,
                 intro_count: int = 0) -> None:
@@ -10879,7 +10976,12 @@ def _finalize_tts(shots: list[dict], results: dict, episode_num: int) -> None:
             if _tts_clip_matches(ep_dir, nidx, shot["narration"], char=True, path=out_v):
                 shot["tts_path"] = out_v
                 continue
-            if _pocket_tts_generate(shot["narration"], out_v, voice=voice):
+            # The clone reads ONLY the quoted dialogue; the attribution ("said
+            # Margaret") and surrounding narration stay in the narrator voice
+            # (Joe 2026-08-17 - split dialogue from narration per sentence).
+            _narr_v = INTRO_VOICE if nidx < _state_intro_count(episode_num) else STORY_VOICE
+            if _tts_generate_shot(shot, nidx, out_v, char_voice=voice,
+                                  narrator_voice=_narr_v):
                 _normalize_voice_0db(out_v)
                 _tts_map_record(ep_dir, nidx, shot["narration"], char=True)
                 shot["tts_path"] = out_v
@@ -10924,7 +11026,10 @@ def _ensure_all_tts_before_render(shots: list[dict], episode_num: int) -> int:
             s["tts_path"] = out
             continue
         speak = _strip_narration_meta(narr)
-        if speak and _pocket_tts_generate(speak, out, voice=voice):
+        _narr_v = STORY_VOICE if not (nidx < _state_intro_count(episode_num)) else INTRO_VOICE
+        if speak and _tts_generate_shot(s, nidx, out,
+                                        char_voice=voice if char else None,
+                                        narrator_voice=_narr_v):
             _normalize_voice_0db(out)
             _tts_map_record(ep_dir, nidx, speak, char=char)
             s["tts_path"] = out
@@ -10942,13 +11047,20 @@ def _generate_all_tts(shots: list[dict], episode_num: int) -> None:
     ep_dir.mkdir(parents=True, exist_ok=True)
     for idx, shot in enumerate(shots):
         nidx = shot.get("narration_idx", idx)
-        out = str(ep_dir / f"narration_{nidx:02d}.wav")
+        char = False
         voice = _shot_dialogue_voice(shot)
         if not voice and nidx < _state_intro_count(episode_num):
             voice = INTRO_VOICE  # announcement intro voice (Joe 2026-08-13)
-        ok = _pocket_tts_generate(shot["narration"], out, voice=voice)
+        else:
+            char = bool(voice) and voice != INTRO_VOICE
+        out = str(ep_dir / f"narration_{nidx:02d}{'_char' if char else ''}.wav")
+        _narr_v = STORY_VOICE if not (nidx < _state_intro_count(episode_num)) else INTRO_VOICE
+        ok = _tts_generate_shot(shot, nidx, out,
+                                char_voice=voice if char else None,
+                                narrator_voice=_narr_v)
         if ok:
             _normalize_voice_0db(out)
+            _tts_map_record(ep_dir, nidx, shot["narration"], char=char)
             dur = _get_audio_duration(out)
             print(f"  [TTS {idx+1}/{len(shots)}] {dur:.1f}s (0dB) - {shot['narration'][:50]}...")
         else:
@@ -13606,7 +13718,10 @@ def _resume_tts_gap_fill(shots: list[dict], episode_num: int, regen_tts: bool,
                 _is_char = True
             shot["tts_path"] = out
             speak = _strip_stage_directions(shot.get("narration") or "")
-            ok = _pocket_tts_generate(speak, out, voice=_voice)
+            _narr_v = STORY_VOICE if not (intro_count and nidx < intro_count) else INTRO_VOICE
+            ok = _tts_generate_shot(shot, nidx, out,
+                                    char_voice=_voice if _is_char else None,
+                                    narrator_voice=_narr_v)
             if ok:
                 _normalize_voice_0db(out)
                 _tts_map_record(ep_dir, nidx, speak, char=_is_char)
