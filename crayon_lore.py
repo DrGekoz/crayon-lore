@@ -3841,6 +3841,37 @@ def _pace_narration(paras: list[str], bible: Optional[dict] = None,
     return out
 
 
+def _split_tag_aware(text: str) -> list[str]:
+    """Split `text` into sentences on . ! ? (followed by whitespace), but NEVER
+    split INSIDE a [name]...[/name] speaker-tag span. A quoted dialogue line
+    wrapped in tags stays whole even when it contains sentence-ending
+    punctuation, so _extract_speaker_tags always sees a balanced
+    opening+closing tag pair and the voice clone never misses dialogue
+    (Joe 2026-08-17)."""
+    if not text or "[" not in text:
+        return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    spans = [(s, e) for _, s, e in _extract_speaker_tags(text)]
+    parts: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        inside = any(s <= i < e for s, e in spans)
+        if (not inside and ch in ".!?"
+                and i + 1 < n and text[i + 1] in " \t"):
+            parts.append("".join(buf) + ch)
+            buf = []
+            i += 1
+            while i < n and text[i] in " \t":
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _flatten_narration_to_sentences(narration: list[str],
                                     chapter_events: Optional[list] = None,
                                     establishing_map: Optional[dict] = None,
@@ -3873,7 +3904,7 @@ def _flatten_narration_to_sentences(narration: list[str],
         para = re.sub(r"\s+", " ", para).strip()
         if not para:
             continue
-        parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
+        parts = _split_tag_aware(para)
         # Chapter markers / establishing lines are a single line -> one sentence.
         if CHAPTER_RE.match(para) or len(parts) == 0:
             parts = [para]
