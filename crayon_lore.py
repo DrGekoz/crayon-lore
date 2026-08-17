@@ -5196,6 +5196,15 @@ def _build_story_bible(topic: str, paragraphs: list[str]) -> dict:
             hj.setdefault(k, "")
     if not isinstance(bible.get("chapter_moods"), list):
         bible["chapter_moods"] = []
+    # Deterministic character hardening (Joe 2026-08-17): the LLM bible often
+    # misses lore characters entirely (empty roster) - scan the lore text for
+    # every KNOWN Crayon Lore character + alias and inject them, so Darrel /
+    # Margaret / the Duck Pope are ALWAYS in the roster (drives sheets + refs +
+    # voice routing) even when the 4B model returns nothing.
+    try:
+        _harden_bible_characters(bible, paragraphs)
+    except Exception as _he:
+        print(f"  [BIBLE] hardening pass failed ({_he}) - continuing with LLM roster")
     print("  [BIBLE] visual_hook:", str(bible.get("visual_hook", "?"))[:80])
     print("  [BIBLE] deeper_question:", str(bible.get("deeper_question", "?"))[:80])
     print("  [BIBLE] deeper_problem:", str(bible.get("deeper_problem", "?"))[:80])
@@ -6512,6 +6521,99 @@ _CHARACTER_ALIASES = {
 # alias fallback in _crayon_diet_ref (e.g. 'Rat Pope' token 'pope' -> Duck Pope,
 # 'the old don' token 'tony' -> Big Tony).
 _DISTINCT_LORE_CHARS = {k.lower() for k in _CHARACTER_ALIASES} - set(_CRAYON_DIET_RELS)
+
+# Known-character metadata (Joe 2026-08-17): gender + role for every canonical
+# lore character so the DETERMINISTIC bible-hardening pass
+# (_harden_bible_characters) can inject a character into the story bible with
+# correct voice-routing metadata even when the 4B LLM misses it entirely.
+_KNOWN_CHAR_META = {
+    "Darrel": ("male", "Darrel the Time-Traveling Duck, the cybernetic duck protagonist"),
+    "Margaret": ("female", "Margaret the Linguist, translator of duck-kind"),
+    "Duck Pope": ("male", "The Duck Pope, spiritual leader of the flock"),
+    "Big Tony Mozarella": ("male", "Big Tony Mozarella, boss of the Big Cheese operation"),
+    "Errol": ("male", "Errol the Collector, who collects religions"),
+    "Nonna Rosa": ("female", "Nonna Rosa, the Mozarella matriarch"),
+    "Salvatore": ("male", "Salvatore Mozarella, the old don of the family"),
+    "Cormac": ("male", "Cormac the Firebrand, the once-heretic"),
+    "Priya": ("female", "Priya, the first apprentice"),
+    "Sven": ("male", "Sven the old goose"),
+    "Rat Pope": ("male", "The Rat Pope of the sewer"),
+    "Broccolini Biceps": ("male", "Broccolini Biceps, Crayon Diet cast bot"),
+    "Bro-Tech": ("male", "Bro-Tech, Crayon Diet cast bot"),
+    "Skibidi Sarah": ("female", "Skibidi Sarah, Crayon Diet cast bot"),
+    "Big Tony": ("male", "Big Tony Mozarella, Crayon Diet cast bot"),
+}
+# Cast-bot bibles fold into the CANONICAL Crayon Diet refs (not distinct sheets).
+_KNOWN_CHAR_CAST_SET = {
+    "duck pope", "broccolini biceps", "big tony", "big tony mozarella",
+    "big tony mozzarella", "bro tech", "brotech", "bro-tech", "skibidi sarah",
+}
+
+
+def _harden_bible_characters(bible: dict, paragraphs: list[str]) -> dict:
+    """Deterministic character-detection hardening for Crayon Lore (Joe
+    2026-08-17): after the LLM story bible is built, scan the lore text for
+    every KNOWN character (canonical names + all aliases in _CHARACTER_ALIASES,
+    _CRAYON_DIET_ALIAS, _CRAYON_VOICE_ALIAS) and inject any that appear into
+    bible["characters"] with correct gender/role metadata.
+
+    The 4B LLM often misses lore characters (it returns role labels instead of
+    names, or omits a protagonist like Darrel entirely). Because the shots'
+    character fields then resolve via _canonical_character_name / _crayon_diet_ref
+    anyway, the MISSING piece was the bible roster - which drives gender/role
+    registration (_register_bible_characters) and voice routing. This pass makes
+    the roster deterministic: any known character mentioned in the lore is
+    ALWAYS locked into the bible, regardless of what the LLM returned.
+    """
+    if not paragraphs:
+        return bible
+    chars = list(bible.get("characters") or [])
+    present = {str(c.get("name", "")).strip().lower(): c
+               for c in chars if isinstance(c, dict)}
+    blob = " \n".join(p for p in paragraphs if p).lower()
+
+    # 1) Known lore characters: check canonical name + every alias phrase.
+    for canon, (gender, role) in _KNOWN_CHAR_META.items():
+        cl = canon.lower()
+        if cl in present:
+            continue
+        hits = [cl]
+        for aliases in (_CHARACTER_ALIASES.get(canon) or []):
+            hits.append(aliases.lower())
+        # Also add voice-router titles for this canonical (e.g. Duck Pope's
+        # 'autocorrect', 'crisp father' in _CRAYON_VOICE_ALIAS) so a lore text
+        # that only uses those titles still detects the character.
+        for _va, _vc in _CRAYON_VOICE_ALIAS.items():
+            if _vc == cl:
+                hits.append(_va.lower())
+        if any(h in blob for h in hits if h):
+            e = {"name": canon, "role": role, "gender": gender,
+                 "age": "adult", "relation": "known Crayon Lore character"}
+            if cl in _KNOWN_CHAR_CAST_SET:
+                e["cast_bot"] = True
+            chars.append(e)
+            present[cl] = e
+            print(f"  [BIBLE] hardened: detected '{canon}' "
+                  f"(known lore character)")
+
+    # 2) Cast-bot aliases that aren't already canonical names (e.g. bare 'duck'
+    #    -> Duck Pope, 'bro' -> Bro-Tech, 'tonio' -> Big Tony). These fold into
+    #    the Crayon Diet ref path, so they only need bible presence for roster /
+    #    voice metadata - they never get a lore-custom sheet.
+    for alias, canon in _CRAYON_DIET_ALIAS.items():
+        cl = canon.lower()
+        if cl in present or cl in _KNOWN_CHAR_META:
+            continue
+        if alias in blob and len(alias) >= 4:
+            e = {"name": canon.title(), "role": "Crayon Diet cast bot",
+                 "gender": "male" if canon not in ("skibidi sarah",) else "female",
+                 "age": "adult", "relation": "Crayon Diet cast bot",
+                 "cast_bot": True}
+            chars.append(e)
+            present[cl] = e
+            print(f"  [BIBLE] hardened: detected '{canon}' (cast-bot alias '{alias}')")
+    bible["characters"] = chars
+    return bible
 
 
 def _char_safe(name: str) -> str:
@@ -13612,6 +13714,14 @@ def _rebuild_script_for_resume(state: dict) -> dict:
             establishing_map, anchor_events)
     context = _build_episode_context(topic, paragraphs)
     bible = _build_directors_bible(topic, narration)
+    # Merge the STORY bible's character roster into the state bible (Joe
+    # 2026-08-17): the directors bible has no 'characters' key, and persisting
+    # only the directors bible made every resume see an EMPTY character roster
+    # ("0 character sheets / Darrel wasn't found"). The merged dict is what
+    # gets saved to the resume state so characters survive a crash.
+    _state_bible = dict(bible or {})
+    if story_bible and story_bible.get("characters"):
+        _state_bible["characters"] = story_bible["characters"]
     _build_scene_board(narration, topic, episode_num)
     _plan_durations(narration)
 
@@ -14131,6 +14241,10 @@ def _resume_episode(state: dict) -> None:
     location_sheets = state.get("location_sheets", {})
     prop_assets = state.get("prop_assets", {})
     brand_assets = _scan_brand_assets()
+    # Story bible restored from state (Joe 2026-08-17): carries the character
+    # roster + metadata so resume never loses the locked characters. The regen
+    # menu option below can rebuild it from the saved narration.
+    _resume_bible = state.get("bible") or {}
     titles = state.get("titles", [])
     description = state.get("description", "")
     tags = state.get("tags", [])
@@ -14174,6 +14288,7 @@ def _resume_episode(state: dict) -> None:
         _swap_model = _yn("    Swap the image-gen model (backend/model)? [y/N]: ")
         _regen_shotlist = _yn("    Regenerate the SHOT LIST (re-run shot-list LLM to fill parse-failed/missing shots)? [y/N]: ")
         _regen_keywords = _yn("    Regenerate key-words from existing narration? [y/N]: ")
+        _regen_bible = _yn("    Regenerate STORY BIBLE (character detection, rebuilds sheets/refs)? [y/N]: ")
         if _regen_clips:
             os.environ["REGEN_CLIPS"] = "1"
             print("  [RESUME] Regenerating ALL video clips (reuse disabled)")
@@ -14220,6 +14335,38 @@ def _resume_episode(state: dict) -> None:
             os.environ["REGEN_CLIPS"] = "1"
             print("  [RESUME] Key-words regenerated from existing narration -> "
                   "video will re-render to bake the new highlights")
+        if _regen_bible:
+            # Re-run character detection from the saved narration (the lore
+            # text itself, or the article if the state has an article_url) and
+            # rebuild the character sheets/refs so a missed character (Darrel,
+            # Margaret, ...) is finally locked into the roster. No full script
+            # rebuild - narration, shots and TTS are untouched. (Joe 2026-08-17)
+            _bible_src = None
+            if article_url:
+                try:
+                    _bible_src = fetch_article_paragraphs(article_url)
+                except Exception as _fe:
+                    print(f"  [BIBLE] article re-fetch failed ({_fe}) - using saved narration")
+            if not _bible_src:
+                _bible_src = state.get("narration") or [
+                    s.get("narration", "") for s in shots if s.get("narration")]
+            if not _bible_src:
+                print("  [BIBLE] no narration/article to detect characters from - "
+                      "cannot regenerate the story bible")
+            else:
+                _rebuilt_bible = _build_story_bible(topic, list(_bible_src))
+                _register_bible_characters(_rebuilt_bible)
+                _resume_bible = _rebuilt_bible
+                character_sheets = _build_character_sheets(
+                    shots, state.get("narration")
+                    or [s.get("narration", "") for s in shots],
+                    bible=_rebuilt_bible)
+                _wants_img_regen = True
+                os.environ["REGEN_IMAGES"] = "1"
+                os.environ["REGEN_CLIPS"] = "1"  # clips embed the image - must re-render
+                print(f"  [BIBLE] story bible regenerated -> "
+                      f"{len(_rebuilt_bible.get('characters') or [])} character(s), "
+                      f"{len(character_sheets)} sheet def(s) -> forcing image regeneration")
         if _swap_model:
             _ask_image_model_swap()
             os.environ["REGEN_IMAGES"] = "1"
@@ -14306,17 +14453,48 @@ def _resume_episode(state: dict) -> None:
                            thumb_path, video_path, video_id,
                            chapter_events, anchor_events,
                            location_sheets, prop_assets,
-                           target_paras=target_paras)
+                           target_paras=target_paras,
+                           narration=state.get("narration") or [],
+                           context=state.get("context") or {},
+                           bible=_resume_bible,
+                           sentence_para_map=state.get("sentence_para_map") or {},
+                           establishing_map=state.get("establishing_map") or {},
+                           intro_count=int(state.get("intro_count", 0) or 0))
 
-    # 0a. Rebuild character sheets if the crash-window checkpoint left them
+    # 0a. Restore the story bible's character metadata (Joe 2026-08-17): the
+    #     saved state carries the bible so voice routing + gender/role maps for
+    #     bible-locked characters survive a resume. A state saved by an OLD
+    #     version may have an empty bible - in that case re-register the
+    #     characters that the shots reference so dialogue STILL routes to the
+    #     right clone (Darrel/Margaret/...). If the bible is genuinely empty,
+    #     run the deterministic hardening pass over the shot narration so the
+    #     known roster is re-locked even without an LLM call.
+    if not _resume_bible.get("characters"):
+        _scan_narr = [s.get("narration", "") for s in shots if s.get("narration")]
+        if _scan_narr:
+            try:
+                _harden_bible_characters(_resume_bible, _scan_narr)
+                print(f"  [RESUME] story bible character roster re-hardened "
+                      f"({len(_resume_bible.get('characters') or [])} known "
+                      f"characters locked from shot narration)")
+            except Exception as _be:
+                print(f"  [RESUME] bible hardening failed ({_be})")
+    _register_bible_characters(_resume_bible)
+
+    # 0b. Rebuild character sheets if the crash-window checkpoint left them
     #     empty (shot list saved, sheets not yet built) so image gen still
-    #     has identity refs for every character (Joe 2026-08-17).
-    if not character_sheets and shots and state.get("narration"):
-        character_sheets = _build_character_sheets(
-            shots, state.get("narration") or [], bible=state.get("bible") or None)
-        print(f"  [RESUME] rebuilt {len(character_sheets)} character sheet(s) "
-              f"from the checkpoint (they were not saved yet)")
-        _save("story")
+    #     has identity refs for every character (Joe 2026-08-17). Falls back
+    #     to per-shot narration when the state's narration list is missing
+    #     (an old _save dropped it - Joe 2026-08-17).
+    if not character_sheets and shots:
+        _sheet_narr = state.get("narration") or [
+            s.get("narration", "") for s in shots if s.get("narration")]
+        if _sheet_narr:
+            character_sheets = _build_character_sheets(
+                shots, _sheet_narr, bible=_resume_bible)
+            print(f"  [RESUME] rebuilt {len(character_sheets)} character sheet(s) "
+                  f"from the checkpoint (they were not saved yet)")
+            _save("story")
 
     # 0. TTS GAP-FILL FIRST (Joe 2026-08-09): generate any missing narration
     #    clips BEFORE image generation, so images are never rendered against
@@ -15125,6 +15303,14 @@ def _phase_llm(config: dict):
 
     context = _build_episode_context(topic, paragraphs)
     bible = _build_directors_bible(topic, narration)
+    # Merge the STORY bible's character roster into the state bible (Joe
+    # 2026-08-17): the directors bible has no 'characters' key, and persisting
+    # only the directors bible made every resume see an EMPTY character roster
+    # ("0 character sheets / Darrel wasn't found"). The merged dict is what
+    # gets saved to the resume state so characters survive a crash.
+    _state_bible = dict(bible or {})
+    if story_bible and story_bible.get("characters"):
+        _state_bible["characters"] = story_bible["characters"]
     _build_scene_board(narration, topic, episode_num)
     _plan_durations(narration)
 
@@ -15159,7 +15345,7 @@ def _phase_llm(config: dict):
                            anchor_events=anchor_events,
                            location_sheets={}, prop_assets={},
                            target_paras=target_paras,
-                           narration=narration, context=context, bible=bible,
+                           narration=narration, context=context, bible=_state_bible,
                            sentence_para_map=sentence_para_map,
                            establishing_map=establishing_map,
                            intro_count=_cint)
@@ -15218,7 +15404,7 @@ def _phase_llm(config: dict):
                        anchor_events=anchor_events,
                        location_sheets=location_sheets, prop_assets=prop_assets,
                        target_paras=target_paras,
-                       narration=narration, context=context, bible=bible,
+                       narration=narration, context=context, bible=_state_bible,
                        sentence_para_map=sentence_para_map,
                        establishing_map=establishing_map,
                        intro_count=_intro_count)
