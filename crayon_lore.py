@@ -236,6 +236,7 @@ _PINNED_CHAR_VOICES = {
     "darrel": _CLONE_SASSY,                          # Darrel the cyber-duck -> Sassy clone
     "duck": _DUCK_POPE_CLONE,                        # Duck (the pet) -> Duck Pope's Crayon Diet voice
     "duck pope": _DUCK_POPE_CLONE,                   # Duck Pope -> his actual Crayon Diet voice
+    "margaret": "fantine",                           # Margaret the Linguist -> distinct female catalog voice
 }
 
 # Young-version voices (Joe 2026-08-17): young/alternate mentions of a Crayon
@@ -271,6 +272,15 @@ def _voice_usable(p: str) -> bool:
     if ":" in p and ("\\" in p or "/" in p):
         return os.path.isfile(p)
     return True
+
+
+def _voice_label(v: Optional[str]) -> str:
+    """Human-readable label for a voice value (clone filename or catalog name)."""
+    if not v:
+        return "narrator"
+    if isinstance(v, str) and (v.count("\\") > 1 or v.count("/") > 1):
+        return os.path.basename(v)
+    return str(v)
 
 
 def _archetype_voice(name: str, role: str, gender: str) -> Optional[str]:
@@ -5080,6 +5090,90 @@ def _detect_speaker(narr: str) -> Optional[str]:
     return hits[0]
 
 
+# ---------------------------------------------------------------------------
+# LLM-context speaker detection (Joe 2026-08-17)
+# ---------------------------------------------------------------------------
+# _detect_speaker above is a HARD-CODED heuristic (verb-attribution scoring),
+# so a quoted line whose speaker isn't near a known verb ("she said", "repeated
+# Margaret") or whose attribution reads ambiguously can silently fall to the
+# narrator. This helper asks the LLM to read the ENTIRE paragraph and decide
+# who is actually speaking, which correctly routes the voice clone even when
+# the attribution is indirect. It runs BEFORE every quoted ("in quotes") TTS
+# call via _shot_dialogue_voice; if the LLM is unreachable/fails it falls back
+# to the heuristic so a busy model can never stall TTS. Toggle with
+# LLM_VOICE_CHECK=0 to disable.
+_LLM_VOICE_CHECK_ON = os.environ.get("LLM_VOICE_CHECK", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+# Cache: paragraph text -> canonical speaker name (so the same line is only
+# ever sent to the LLM once per run, and the heuristic never re-runs).
+_LLM_SPEAKER_CACHE: dict[str, Optional[str]] = {}
+
+
+def _llm_known_speaker_list() -> list[str]:
+    """Canonical speaker names the LLM is allowed to choose from (Crayon Diet
+    cast + bible-registered + assigned characters), de-duplicated + sorted."""
+    seen, out = set(), []
+    for n in _known_speaker_names() + list(_CHARACTER_ALIASES.keys()):
+        c = _canonical_character_name(n)
+        key = c.lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(c)
+    return sorted(out, key=str.lower)
+
+
+def _llm_detect_speaker(narr: str) -> Optional[str]:
+    """Ask the LLM to read the WHOLE paragraph and identify the speaker of the
+    quoted line from the known cast, based on the surrounding context (not just
+    a verb lookup). Returns the canonical speaker name or None. Fails open to
+    None (so the caller falls back to the heuristic) on any LLM error."""
+    text = (narr or "").strip()
+    if not text or '"' not in text:
+        return None
+    if text in _LLM_SPEAKER_CACHE:
+        return _LLM_SPEAKER_CACHE[text]
+    if not _LLM_VOICE_CHECK_ON:
+        return None
+    known = _llm_known_speaker_list()
+    if not known:
+        return None
+    known_txt = ", ".join(known)
+    sys = ("You determine which character is SPEAKING the quoted dialogue in a "
+           "story narration. Read the ENTIRE paragraph. Consider the attribution "
+           "verb ('said', 'asked', 'whispered'...), pronouns ('she', 'he', 'it'), "
+           "and any other context that reveals who the quote belongs to, even "
+           "when the name is not right next to a verb. Reply with EXACTLY ONE "
+           "canonical name from the allowed list, or the single word NONE if no "
+           "character from the list is speaking (e.g. the narrator quotes "
+           "something as an example, or it is a voice from outside the cast). "
+           "Do not explain. Allowed speakers: " + known_txt)
+    usr = ("Paragraph:\n\"\"\"\n" + text + "\n\"\"\"\n\nWho is speaking the "
+           "quoted line? Reply with one canonical name or NONE.")
+    try:
+        ans = _llm_chat([
+            {"role": "system", "content": sys},
+            {"role": "user", "content": usr},
+        ], max_tokens=40, temp=0.0).strip()
+    except Exception:
+        return None
+    if not ans:
+        return None
+    # Clean + canonicalise whatever the model returned.
+    ans = ans.strip().strip('"\'').strip()
+    if not ans or ans.upper() in ("NONE", "NOBODY", "NO ONE", "N/A", "NULL",
+                                  "UNKNOWN", "NARRATOR"):
+        _LLM_SPEAKER_CACHE[text] = None
+        return None
+    canon = _canonical_character_name(ans)
+    if canon.lower() not in {c.lower() for c in known}:
+        # Model gave a name/alias we can't resolve to a known speaker - fall
+        # back to the heuristic rather than guess a wrong clone.
+        _LLM_SPEAKER_CACHE[text] = None
+        return None
+    _LLM_SPEAKER_CACHE[text] = canon
+    return canon
+
+
 def _shot_dialogue_voice(shot) -> Optional[str]:
     """Voice for a shot's narration (Crayon Lore, Joe 2026-08-15/16): if the
     sentence is DIALOGUE (a quoted line), route it to the SPEAKER's own voice.
@@ -5098,10 +5192,23 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
     # dialogue delimiters, so this guard matches it.
     if '"' not in narr:
         return None
+    # LLM-context speaker check FIRST (Joe 2026-08-17): read the whole paragraph
+    # and decide who speaks, so an indirect/ambiguous attribution still routes
+    # to the right clone. Falls back to the heuristic when the LLM is down.
+    speaker = _llm_detect_speaker(narr)
+    if speaker:
+        v = _resolve_character_voice(speaker)
+        if v:
+            print(f"  [VOICE] {shot.get('narration_idx','?'):>3} LLM: "
+                  f"{speaker!r} -> {_voice_label(v)}")
+            return v
+        return None
     speaker = _detect_speaker(narr)
     if speaker:
         v = _resolve_character_voice(speaker)
         if v:
+            print(f"  [VOICE] {shot.get('narration_idx','?'):>3} heuristic: "
+                  f"{speaker!r} -> {_voice_label(v)}")
             return v
         # Speaker known but has no voice yet (install prompt skipped / no
         # clone available): leave the line on the narrator - do NOT re-prompt
@@ -11297,6 +11404,9 @@ def _pocket_tts_generate(text: str, output_path: str, timeout: int = 180,
         if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1000:
             print(f"  [TTS error] output not created: {output_path}")
             return False
+        # Per-TTS log: which voice + the exact file written (Joe 2026-08-17).
+        print(f"  [TTS written] {os.path.basename(output_path)} "
+              f"({_voice_label(voice)}) {os.path.getsize(output_path)}b")
         return True
     except Exception as e:
         print(f"  [TTS error] {e}")
