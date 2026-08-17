@@ -231,8 +231,38 @@ _CLONE_KANYE = str(_HERMES_VOICE_REFS / "cyclopskanye.wav")      # male
 # archetype matching, gender defaults) so named characters ALWAYS speak with
 # the chosen voice. A pinned file that's missing falls through to normal
 # resolution instead of erroring.
+_DUCK_POPE_CLONE = os.path.join(_CRAYON_DIET_VOICE_DIR, "duck_pope_deep.wav")
 _PINNED_CHAR_VOICES = {
-    "darrel": _CLONE_SASSY,   # Darrel the cyber-duck -> Sassy clone
+    "darrel": _CLONE_SASSY,                          # Darrel the cyber-duck -> Sassy clone
+    "duck": _DUCK_POPE_CLONE,                        # Duck (the pet) -> Duck Pope's Crayon Diet voice
+    "duck pope": _DUCK_POPE_CLONE,                   # Duck Pope -> his actual Crayon Diet voice
+}
+
+# Young-version voices (Joe 2026-08-17): young/alternate mentions of a Crayon
+# Diet character use the +15% pitch-raised variant of their adult clone (e.g.
+# 'Tonio' -> big_tony_young.wav, 'duckling' -> duck_pope_deep_young.wav).
+_YOUNG_VOICE_RELS = {
+    "tonio": "big_tony_young.wav", "the boy": "big_tony_young.wav",
+    "duckling": "duck_pope_deep_young.wav", "the duckling": "duck_pope_deep_young.wav",
+    "young duck": "duck_pope_deep_young.wav", "ducky": "duck_pope_deep_young.wav",
+    "young bro-tech": "bro_tech_young.wav", "young brotech": "bro_tech_young.wav",
+    "kid bro tech": "bro_tech_young.wav", "the kid": "bro_tech_young.wav",
+}
+
+# MANUAL gender overrides (Joe 2026-08-17): deterministic, Joe-approved genders
+# for the whole 10-episode Crayon Lore roster. These win over the LLM bible,
+# the character sheets and the heuristics - an existing character stays its
+# canon gender no matter what the 4B model says (e.g. Margaret is female).
+_GENDER_OVERRIDES = {
+    "darrel": "male", "margaret": "female", "duck": "male",
+    "duck pope": "male", "the duck pope": "male",
+    "errol": "male", "cormac": "male", "priya": "female", "sven": "male",
+    "broccolini biceps": "male", "big tony": "male",
+    "big tony mozarella": "male", "big tony mozzarella": "male",
+    "tonio": "male", "salvatore": "male", "nonna rosa": "female",
+    "bro tech": "male", "brotech": "male", "bro-tech": "male",
+    "skibidi sarah": "female", "rat pope": "male",
+    "professor quackington": "male", "lady featherbottom": "female",
 }
 
 
@@ -293,6 +323,51 @@ def _save_voice_assignments() -> None:
         print(f"  [VOICE] could not save character_voice_assignments.json: {e}")
 
 
+# Full 10-episode cast roster (Joe 2026-08-17): EVERY named speaking character
+# across the 10 Crayon Lore episodes, gender-rolled by hand, each with its own
+# voice (clone path or PocketTTS catalog name). Seeded at startup so a
+# character ALWAYS has the correct gender + voice BEFORE the story bible is
+# built. Crayon Diet cast bots keep their debate-show clones; YOUNG versions
+# use the +15% pitch-raised variant; narration stays on the intro/story
+# narrator.
+_EPISODE_VOICE_SEED = {
+    "darrel": (str(_HERMES_VOICE_REFS / "sassy.wav"), "male"),
+    "margaret": ("alba", "female"),
+    "duck": (_DUCK_POPE_CLONE, "male"),
+    "duck pope": (_DUCK_POPE_CLONE, "male"),
+    "errol": ("charles", "male"),
+    "cormac": ("paul", "male"),
+    "priya": ("vera", "female"),
+    "sven": ("jean", "male"),
+    "broccolini biceps": (os.path.join(_CRAYON_DIET_VOICE_DIR, "broccolini_biceps.wav"), "male"),
+    "big tony": (os.path.join(_CRAYON_DIET_VOICE_DIR, "big_tony.wav"), "male"),
+    "tonio": (os.path.join(_CRAYON_DIET_VOICE_DIR, "big_tony_young.wav"), "male"),
+    "salvatore": ("george", "male"),
+    "nonna rosa": ("anna", "female"),
+    "bro tech": (os.path.join(_CRAYON_DIET_VOICE_DIR, "bro_tech.wav"), "male"),
+    "skibidi sarah": (os.path.join(_CRAYON_DIET_VOICE_DIR, "skibidi_sarah.wav"), "female"),
+    "rat pope": ("michael", "male"),
+    "professor quackington": ("marius", "male"),
+    "lady featherbottom": ("cosette", "female"),
+}
+
+
+def _seed_episode_voices() -> None:
+    """Pipe the full 10-episode roster into the router at startup: gender
+    defaults + voice assignments for every known character (setdefault - a
+    deliberate pin or previously assigned voice is never clobbered)."""
+    _changed = False
+    for _ch, (_voice, _gender) in _EPISODE_VOICE_SEED.items():
+        _cl = _ch.strip().lower()
+        if _cl not in _CHAR_GENDER:
+            _CHAR_GENDER[_cl] = _gender
+        if _cl not in _CHAR_VOICE_ASSIGN and _voice_usable(_voice):
+            _CHAR_VOICE_ASSIGN[_cl] = _voice
+            _changed = True
+    if _changed:
+        _save_voice_assignments()
+
+
 def _register_bible_characters(bible: dict) -> None:
     """Populate the character gender/role maps from the locked STORY BIBLE so
     unknown characters get a gender-appropriate default voice (and so their
@@ -300,25 +375,29 @@ def _register_bible_characters(bible: dict) -> None:
     for c in (bible or {}).get("characters") or []:
         name = str(c.get("name", "")).strip()
         if name:
-            _CHAR_GENDER[name.lower()] = str(c.get("gender") or "male").lower()
+            _bg = str(c.get("gender") or "male").lower()
+            # Manual override (Joe 2026-08-17): canon gender wins over the
+            # 4B's guess for existing characters (Margaret IS female).
+            _CHAR_GENDER[name.lower()] = _GENDER_OVERRIDES.get(name.lower(), _bg)
             _CHAR_ROLE[name.lower()] = str(c.get("role") or "")
             # New characters get auto-generated aliases so their quoted
             # dialogue is recognised under a shortened / alternate name.
             register_character_aliases(
                 name,
                 aliases=c.get("aliases") or [],
-                gender=str(c.get("gender") or "male").lower(),
+                gender=_CHAR_GENDER[name.lower()],
                 role=str(c.get("role") or ""),
             )
     prot = (bible or {}).get("protagonist") or {}
     pname = str(prot.get("name", "")).strip()
     if pname:
-        _CHAR_GENDER[pname.lower()] = str(prot.get("gender") or "male").lower()
+        _pg = str(prot.get("gender") or "male").lower()
+        _CHAR_GENDER[pname.lower()] = _GENDER_OVERRIDES.get(pname.lower(), _pg)
         _CHAR_ROLE[pname.lower()] = str(prot.get("role") or "")
         register_character_aliases(
             pname,
             aliases=prot.get("aliases") or [],
-            gender=str(prot.get("gender") or "male").lower(),
+            gender=_CHAR_GENDER[pname.lower()],
             role=str(prot.get("role") or ""),
         )
     # Gender-consistency cleanup (Joe 2026-08-17): an assignment persisted
@@ -413,9 +492,11 @@ def register_character_aliases(
 
 
 def _gender_for(name: str) -> str:
-    """Return 'female' or 'male' for a character name (bible first, then a
-    light heuristic, then male default)."""
+    """Return 'female' or 'male' for a character name (manual override first,
+    then bible/registered gender, then a light heuristic, then male default)."""
     n = name.lower()
+    if n in _GENDER_OVERRIDES:
+        return _GENDER_OVERRIDES[n]
     if n in _CHAR_GENDER:
         g = _CHAR_GENDER[n]
         return g if g in ("male", "female") else "male"
@@ -528,9 +609,10 @@ def _resolve_character_voice(name: str) -> Optional[str]:
     n = (name or "").strip()
     if not n:
         return None
-    # 1) Crayon Diet clones (their real debate-show voices). The pet 'Duck'
-    #    is exempt so it can't hijack the Pope's clone when both are in roster.
-    cd = _character_voice(n) if not _is_pet_duck(n) else None
+    # 1) Crayon Diet clones (their real debate-show voices). 'Duck' (the pet)
+    #    and 'Duck Pope' BOTH use Duck Pope's clone per Joe - the young map in
+    #    _character_voice handles duckling/Tonio/kid variants.
+    cd = _character_voice(n)
     if cd:
         return cd
     low = n.lower()
@@ -576,14 +658,32 @@ def _resolve_character_voice(name: str) -> Optional[str]:
 
 
 _load_voice_assignments()
+_seed_episode_voices()
 
 
 def _character_voice(char_name: str) -> Optional[str]:
     """Return the Crayon Diet voice clone path for a character name (tolerant
-    exact + token-alias match), or None if the name isn't a known character."""
+    exact + token-alias match), or None if the name isn't a known character.
+    Young/alternate mentions (Tonio, duckling, kid Bro-Tech) resolve to the
+    +15% pitch-raised variant of the adult clone (Joe 2026-08-17)."""
     n = (char_name or "").strip().lower()
     if not n:
         return None
+    # Young-version voices: exact match first, then phrase substrings - a bare
+    # token must never hijack an adult name (e.g. 'tony' must not match 'tonio').
+    raw = (char_name or "").strip().lower()
+    if raw in _YOUNG_VOICE_RELS:
+        yp = Path(_CRAYON_DIET_VOICE_DIR) / _YOUNG_VOICE_RELS[raw]
+        if yp.is_file():
+            return str(yp)
+    for yk, yrel in _YOUNG_VOICE_RELS.items():
+        if yk == raw or " " not in yk or len(yk) < 4:
+            continue
+        if yk in raw:
+            yp = Path(_CRAYON_DIET_VOICE_DIR) / yrel
+            if yp.is_file():
+                return str(yp)
+            break
     rel = CHARACTER_VOICES.get(n)
     if rel is None:
         for token in n.split():
@@ -4895,6 +4995,22 @@ def _detect_speaker(narr: str) -> Optional[str]:
         if len(_tok) >= 4 and re.search(rf"\b{re.escape(_tok)}\b", low):
             if _canon not in hits:
                 hits.append(_canon)
+    # Canonical-alias pass (Joe 2026-08-17): role titles ('the linguist' ->
+    # Margaret, 'the collector' -> Errol, 'the first apprentice' -> Priya,
+    # 'the old goose' -> Sven) and young-version names ('duckling', 'Tonio',
+    # 'the kid') route dialogue to the right voice even when the speaker is
+    # named by title rather than by name. Young names are appended AS-IS so
+    # _character_voice's young map picks the pitch-raised clone.
+    for _canon, _aliases in _CHARACTER_ALIASES.items():
+        for _a in _aliases:
+            if len(_a) >= 4 and re.search(rf"\b{re.escape(_a)}\b", low):
+                if _canon.lower() not in hits:
+                    hits.append(_canon.lower())
+                break
+    for _yk in sorted(_YOUNG_VOICE_RELS, key=len, reverse=True):
+        if len(_yk) >= 4 and re.search(rf"\b{re.escape(_yk)}\b", low):
+            if _yk not in hits:
+                hits.append(_yk)
     if not hits:
         return None
 
