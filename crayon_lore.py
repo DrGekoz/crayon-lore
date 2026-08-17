@@ -13570,10 +13570,18 @@ def _resume_tts_gap_fill(shots: list[dict], episode_num: int, regen_tts: bool,
             _narr = (s.get("narration") or "").strip()
             _disk = str(ep_dir / f"narration_{_nidx:02d}.wav")
             _disk_char = str(ep_dir / f"narration_{_nidx:02d}_char.wav")
-            # Prefer the exact clip for this shot's voice (char variant if the
-            # shot uses a clone voice, else the narrator variant).
-            if _voice and _tts_clip_matches(ep_dir, _nidx, _narr, char=True, path=_disk_char):
-                s["tts_path"] = _disk_char
+            # A shot that is DIALOGUE (resolves to a character clone voice) must
+            # NEVER be satisfied by a narrator clip, even one already on disk.
+            # Reusing the narrator file for a spoken character line is the bug
+            # that made dialogue come out in the narrator's voice (Joe 2026-08-17):
+            # the narrator clip was left over from the parallel worker, so the
+            # char clip was never generated. Dialogue shots only accept the
+            # _char.wav variant; anything else is regenerated in the clone voice.
+            if _voice:
+                if _tts_clip_matches(ep_dir, _nidx, _narr, char=True, path=_disk_char):
+                    s["tts_path"] = _disk_char
+                    continue
+                missing_tts.append(s)
                 continue
             if _tts_clip_matches(ep_dir, _nidx, _narr, char=False, path=_disk):
                 s["tts_path"] = _disk
