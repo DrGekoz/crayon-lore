@@ -5180,22 +5180,34 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
     The 5 Crayon Diet characters use their debate-show clones; any other named
     character is auto-assigned a gender-matched default PocketTTS voice (or a
     matching Sassy/Bob/Kanye clone). No two characters ever share a voice.
-    Returns None so narration stays in the narrator (intro/story) voice."""
+    Returns None so narration stays in the narrator (intro/story) voice.
+
+    Cross-sentence dialogue (Joe 2026-08-17): a character's quote often spans
+    several sentence-shots, but only the FIRST sentence carries the attribution
+    ("said Duck"). The shot's `paragraph_context` holds the whole paragraph, so
+    speaker detection runs on THAT - a continuation sentence inside the same
+    quote inherits the speaker identified from the full paragraph instead of
+    silently falling to the narrator."""
     narr = (shot.get("narration") or "").strip()
     if not narr:
         return None
+    # Full dialogue context: the shot's own sentence, expanded to its whole
+    # paragraph so a continuation sentence inside a cross-sentence quote still
+    # resolves the speaker named earlier in the paragraph.
+    ctx = (shot.get("paragraph_context") or narr).strip()
     # Only DOUBLE-quoted lines count as dialogue (narrator describes in the
     # rest). Single quotes are almost always apostrophes in English narration
     # ("Darrel's", "it's"), so checking for them would mis-route plain
     # narration that merely mentions a character into that character's voice.
-    # The detector (_detect_speaker) also only treats double quotes as
-    # dialogue delimiters, so this guard matches it.
-    if '"' not in narr:
+    # Check the whole paragraph, not just this sentence - a continuation shot
+    # like idx 60 "The laugh is sacred." has no quote of its own but sits
+    # inside a quote that opened in the previous shot.
+    if '"' not in ctx:
         return None
     # LLM-context speaker check FIRST (Joe 2026-08-17): read the whole paragraph
     # and decide who speaks, so an indirect/ambiguous attribution still routes
     # to the right clone. Falls back to the heuristic when the LLM is down.
-    speaker = _llm_detect_speaker(narr)
+    speaker = _llm_detect_speaker(ctx)
     if speaker:
         v = _resolve_character_voice(speaker)
         if v:
@@ -5203,7 +5215,7 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
                   f"{speaker!r} -> {_voice_label(v)}")
             return v
         return None
-    speaker = _detect_speaker(narr)
+    speaker = _detect_speaker(ctx)
     if speaker:
         v = _resolve_character_voice(speaker)
         if v:
@@ -11430,7 +11442,8 @@ def _normalize_voice_0db(wav_path: str) -> str:
 
 
 def _split_dialogue_segments(narr: str, char_voice: Optional[str],
-                             narrator_voice: Optional[str]) -> list[tuple[str, Optional[str]]]:
+                             narrator_voice: Optional[str],
+                             paragraph_context: Optional[str] = None) -> list[tuple[str, Optional[str]]]:
     """Split ONE narration sentence into (text, voice) sub-segments so a spoken
     line like:  "Quack, and know peace," said the Duck Pope, and his voice rolled.
     comes out as TWO TTS clips:
@@ -11443,6 +11456,15 @@ def _split_dialogue_segments(narr: str, char_voice: Optional[str],
     sentence returns a single narrator segment. Contiguous narrator runs are merged
     back into one clip so a sentence with one quote yields exactly 2 clips.
 
+    Cross-sentence quotes (Joe 2026-08-17): a character's quote often spans several
+    sentence-shots (e.g. idx 59 `"The duck is eternal.` opens a quote that only
+    closes two shots later). The single-sentence regex below would miss the open
+    quote (no close in this sentence) or the close (no open), so the fragment fell
+    back to the narrator even when a voice WAS resolved. When `paragraph_context`
+    is given, quote spans are computed over the WHOLE paragraph first, then mapped
+    onto this sentence - so a continuation fragment sitting inside a quote that
+    opened/closed elsewhere still gets the clone voice for its quoted portion.
+
     Returns a list of (text, voice) where voice is the clone path or None (narrator).
     """
     narr = (narr or "").strip()
@@ -11450,9 +11472,14 @@ def _split_dialogue_segments(narr: str, char_voice: Optional[str],
         return []
     # Quoted spans (double-quoted dialogue) get the clone voice; everything else
     # outside the quotes is the narrator (attribution + surrounding narration).
-    spans = []
-    for m in re.finditer(r'"[^"]*"', narr):
-        spans.append((m.start(), m.end()))
+    # Use the full paragraph's quote state when available so cross-sentence
+    # quotes are handled; otherwise fall back to balanced quotes in this sentence.
+    if paragraph_context and char_voice:
+        spans = _dialogue_spans_in_sentence(narr, paragraph_context)
+    else:
+        spans = []
+        for m in re.finditer(r'"[^"]*"', narr):
+            spans.append((m.start(), m.end()))
     if not spans or not char_voice:
         return [(narr, None)]
     segs: list[tuple[str, Optional[str]]] = []
@@ -11469,6 +11496,9 @@ def _split_dialogue_segments(narr: str, char_voice: Optional[str],
     # Merge adjacent narrator segments so one quote -> exactly dialogue + narrator.
     merged: list[tuple[str, Optional[str]]] = []
     for text, voice in segs:
+        # Quote marks are delimiters, not spoken text - drop them so a bare
+        # opening/closing quote never becomes its own "quote" TTS segment.
+        text = text.replace('"', " ").strip()
         if not text:
             continue
         if voice is None and merged and merged[-1][1] is None:
@@ -11476,7 +11506,57 @@ def _split_dialogue_segments(narr: str, char_voice: Optional[str],
         else:
             merged.append((text, voice))
     merged = [(t, v) for t, v in merged if t.strip()]
-    return merged if merged else [(narr, None)]
+    return merged if merged else [(narr.replace('"', " ").strip(), None)]
+
+
+def _dialogue_spans_in_sentence(narr: str, paragraph_context: str) -> list[tuple[int, int]]:
+    """Quote spans (start, end) WITHIN `narr` computed from the whole paragraph's
+    quote state, so a sentence that opens a cross-sentence quote (idx 59 `"The
+    duck is eternal.`) or closes one (idx 61 `...know it or not."`) still has its
+    quoted portion flagged. Returns [] if narr can't be located in the context."""
+    narr = (narr or "").strip()
+    para = (paragraph_context or "").strip()
+    if not narr or not para:
+        return []
+    # Locate narr inside the paragraph (tolerant of leading/trailing whitespace).
+    idx = para.find(narr)
+    if idx < 0:
+        return []
+    # Quote-state walk over the whole paragraph: toggle on every double-quote.
+    # in_quote[i] = True iff position i (in para) is inside a quoted span.
+    in_quote = [False] * len(para)
+    open_q = None
+    for i, ch in enumerate(para):
+        if ch == '"':
+            if open_q is None:
+                open_q = i
+            else:
+                for j in range(open_q, i + 1):
+                    in_quote[j] = True
+                open_q = None
+    if open_q is not None:
+        for j in range(open_q, len(para)):
+            in_quote[j] = True
+    # Map the quote state onto narr's range and return contiguous quoted spans.
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(narr):
+        p = idx + i
+        if p < len(in_quote) and in_quote[p]:
+            s = i
+            while i < len(narr) and (idx + i) < len(in_quote) and in_quote[idx + i]:
+                i += 1
+            # trim the outer quote characters themselves (kept out of TTS text)
+            a, b = s, i
+            while a < b and narr[a] == '"':
+                a += 1
+            while b > a and narr[b - 1] == '"':
+                b -= 1
+            if b > a:
+                spans.append((a, b))
+        else:
+            i += 1
+    return spans
 
 
 def _tts_generate_shot(shot: dict, nidx: int, out_path: str,
@@ -11491,7 +11571,11 @@ def _tts_generate_shot(shot: dict, nidx: int, out_path: str,
     if not text:
         return False
     narrator_voice = narrator_voice or STORY_VOICE
-    segs = _split_dialogue_segments(text, char_voice, narrator_voice)
+    # Pass the full paragraph context so a sentence that opens/closes a
+    # cross-sentence quote still gets its quoted portion in the clone voice
+    # (Joe 2026-08-17).
+    segs = _split_dialogue_segments(text, char_voice, narrator_voice,
+                                    paragraph_context=shot.get("paragraph_context"))
     if len(segs) <= 1:
         v = segs[0][1] if segs else None
         return _pocket_tts_generate(text, out_path, voice=v or narrator_voice)
