@@ -4348,28 +4348,39 @@ def _fuzzy_foley_match(phrase: str) -> Optional[str]:
 
 
 def _apply_plan_to_shots(shots: list[dict], sentence_para_map: dict,
-                         plan: dict) -> None:
-    """Mirror the narration plan (key words + foley) onto the sentence-level shots.
+                         plan: dict, narration_sentences: Optional[list] = None) -> None:
+    """Mirror the narration plan (key words + foley) onto the shot list.
     Matches by TEXT, so it is robust to chapter/establishing/flatten index
-    remapping. Sets shot['is_key'], shot['key_words'], shot['foley']."""
+    remapping. For a shot that is a min-4s narration BEAT (narration_idxs of
+    several sentences, Joe 2026-08-17), it also matches each MEMBER sentence so
+    key highlights and foley still fire. Sets shot['is_key'], shot['key_words'],
+    shot['foley']."""
     for shot in shots:
-        ns = _norm_text(shot.get("narration") or "")
+        cands = [shot.get("narration") or ""]
+        if narration_sentences:
+            for _mi in (shot.get("narration_idxs") or []):
+                if 0 <= _mi < len(narration_sentences):
+                    cands.append(narration_sentences[_mi])
         shot["is_key"] = False
         shot["key_words"] = []
         shot["foley"] = []
-        if not ns:
+        if not any(cands):
             continue
-        for _pi, entry in plan.items():
-            ks = _norm_text(entry.get("key_sentence") or "")
-            if ks and (ks == ns or (ks in ns or ns in ks)):
-                shot["is_key"] = True
-                shot["key_words"] = [w for w in (entry.get("key_words") or []) if w][:3]
-            for f in (entry.get("foley") or []):
-                trig = _norm_text(str(f.get("trigger") or ""))
-                if trig and trig in ns:
-                    sfx = _fuzzy_foley_match(str(f.get("sound") or ""))
-                    if sfx:
-                        shot["foley"].append({"sfx": sfx, "trigger": str(f.get("trigger"))})
+        for ns in cands:
+            ns = _norm_text(ns)
+            if not ns:
+                continue
+            for _pi, entry in plan.items():
+                ks = _norm_text(entry.get("key_sentence") or "")
+                if ks and (ks == ns or (ks in ns or ns in ks)):
+                    shot["is_key"] = True
+                    shot["key_words"] = [w for w in (entry.get("key_words") or []) if w][:3]
+                for f in (entry.get("foley") or []):
+                    trig = _norm_text(str(f.get("trigger") or ""))
+                    if trig and trig in ns:
+                        sfx = _fuzzy_foley_match(str(f.get("sound") or ""))
+                        if sfx:
+                            shot["foley"].append({"sfx": sfx, "trigger": str(f.get("trigger"))})
         seen, uniq = set(), []
         for f in shot["foley"]:
             if f["sfx"] not in seen:
@@ -10949,22 +10960,15 @@ def _generate_all_shots(shots: list[dict], character_sheets: Optional[dict] = No
             shots, character_sheets, sheets_dir, 70000 + episode_num,
             sheets_cache=sheets)
 
-    # ---- MIN-4s IMAGE GROUPING (Joe 2026-08-17) ----
-    # Shots whose TTS is shorter than 4s share ONE image until their combined
-    # audio hits 4s - never generate more images than needed. Followers skip
-    # generation and reuse the group lead's output file; the render pass merges
-    # consecutive same-image clips into one continuous segment.
-    _n_groups = _group_shots_min4(shots, episode_num)
-    print(f"  [IMAGES] {len(shots)} shots grouped into {_n_groups} images "
-          f"(min 4s of audio per image - followers share the lead's image)")
-
     # ---- SHOT-PROMPT VERIFICATION DEFINITIONS (used by cards + chunked render) ----
+    # NOTE: min-4s image grouping now happens at SHOT-LIST time (narration is
+    # chunked into >=4s beats, one shot per beat) - so every shot here already
+    # represents one image. No post-hoc grouping needed (Joe 2026-08-17).
     from concurrent.futures import ThreadPoolExecutor as _TPE
     CHUNK = max(1, min(int(os.environ.get("SHOT_CHUNK_SIZE", "5")), len(shots) or 1))
     _regen = os.environ.get("REGEN_IMAGES", "0").strip().lower() in ("1", "yes", "y", "true")
     _todo = [s for s in shots
              if not s.get("is_chapter")
-             and s.get("image_lead") is None
              and (_regen or not _shot_image_ok(s))]
 
     def _verify_chunk(chunk: list) -> int:
@@ -11076,11 +11080,6 @@ def _generate_all_shots(shots: list[dict], character_sheets: Optional[dict] = No
             else:
                 with _plock:
                     print(f"  [SHOT {idx+1}/{len(shots)}] chapter placeholder (no image)")
-            return
-        # Grouped follower (Joe 2026-08-17): shares the group LEAD's image
-        # (min-4s chunks) - its image_path already points at the lead's file,
-        # so there is nothing to generate here.
-        if shot.get("image_lead") is not None:
             return
         # REGEN_IMAGES=1 -> force re-generate (overwrite) instead of resuming.
         _regen = os.environ.get("REGEN_IMAGES", "0").strip().lower() in ("1", "yes", "y", "true")
@@ -14165,7 +14164,7 @@ def _rebuild_script_for_resume(state: dict) -> dict:
     shots = _build_shot_list(narration, bible=_shot_bible, context=context,
                              establishing_map=establishing_map,
                              sentence_para_map=sentence_para_map)
-    _apply_plan_to_shots(shots, sentence_para_map, plan)  # key words + foley onto shots
+    _apply_plan_to_shots(shots, sentence_para_map, plan, narration_sentences=narration)  # key words + foley onto shots
 
     character_sheets = _build_character_sheets(shots, narration, bible=story_bible)
     brands = _extract_brands(topic, paragraphs, narration)
@@ -15621,6 +15620,149 @@ def _episode_setup(default_ep: int):
     }
 
 
+def _sentence_final_clip(episode_num: int, i: int) -> Optional[str]:
+    """Preferred on-disk TTS clip for sentence index i: the per-character
+    dialogue clip (narration_XX_char.wav) if present, else the narrator clip
+    (narration_XX.wav). None if neither exists."""
+    ep_dir = _ep_tts_dir(episode_num)
+    charp = str(ep_dir / f"narration_{i:02d}_char.wav")
+    if os.path.isfile(charp) and os.path.getsize(charp) > 1000:
+        return charp
+    np = str(ep_dir / f"narration_{i:02d}.wav")
+    if os.path.isfile(np) and os.path.getsize(np) > 1000:
+        return np
+    return None
+
+
+def _sentence_dur(narration: list[str], i: int, episode_num: int) -> float:
+    """Real audio duration of sentence i's FINAL clip (ffprobe), falling back
+    to a ~3.2 words/sec estimate when the clip isn't on disk."""
+    clip = _sentence_final_clip(episode_num, i)
+    if clip:
+        d = _wav_duration(clip)
+        if d > 0:
+            return d
+    return len(re.findall(r"\S+", narration[i] or "")) / 3.2
+
+
+def _finalize_sentence_clips(narration: list[str], episode_num: int,
+                             intro_count: int) -> None:
+    """Generate the per-character dialogue split clip for every dialogue
+    sentence (the clone reads the quoted line, the narrator the attribution),
+    so each sentence has its FINAL voice clip before chunk durations are
+    measured (Joe 2026-08-17 - chunked shot list needs real durations)."""
+    ep_dir = _ep_tts_dir(episode_num)
+    made = 0
+    for i, text in enumerate(narration):
+        if not text or CHAPTER_RE.match(text):
+            continue
+        nidx = i
+        out_v = str(ep_dir / f"narration_{nidx:02d}_char.wav")
+        if _tts_clip_matches(ep_dir, nidx, text, char=True, path=out_v):
+            continue
+        pseudo = {"narration": text, "narration_idx": nidx, "is_chapter": False}
+        voice = _shot_dialogue_voice(pseudo)
+        if not voice:
+            continue
+        _narr_v = INTRO_VOICE if nidx < intro_count else STORY_VOICE
+        if _tts_generate_shot(pseudo, nidx, out_v, char_voice=voice,
+                              narrator_voice=_narr_v):
+            _normalize_voice_0db(out_v)
+            _tts_map_record(ep_dir, nidx, text, char=True)
+            made += 1
+    print(f"  [TTS] {made} dialogue sentences split into per-character voice clips")
+
+
+def _chunk_narration_min4(narration: list[str], episode_num: int,
+                          min_dur: float = 4.0) -> list[dict]:
+    """Group the flat narration into beats of >= min_dur seconds of audio -
+    the min-4s image grouping done at SHOT-LIST time (Joe 2026-08-17). Each
+    beat becomes ONE shot / ONE image. Chapter markers form their own single
+    beat and are never merged across a chapter boundary. Returns a list of
+    {'idxs': [sentence idxs], 'text': joined text, 'dur': seconds,
+     'chapter': bool}."""
+    def _beat(idx_list: list[int]) -> dict:
+        return {"idxs": list(idx_list),
+                "text": " ".join(narration[j] for j in idx_list),
+                "dur": sum(_sentence_dur(narration, j, episode_num) for j in idx_list),
+                "chapter": False}
+
+    beats: list[dict] = []
+    cur: list[int] = []
+    cur_dur = 0.0
+    for i, text in enumerate(narration):
+        if not text:
+            continue
+        if CHAPTER_RE.match(text):
+            if cur:
+                beats.append(_beat(cur))
+                cur, cur_dur = [], 0.0
+            beats.append({"idxs": [i], "text": text,
+                          "dur": _sentence_dur(narration, i, episode_num),
+                          "chapter": True})
+            continue
+        d = _sentence_dur(narration, i, episode_num)
+        if d >= min_dur:
+            if cur:
+                beats.append(_beat(cur))
+                cur, cur_dur = [], 0.0
+            beats.append({"idxs": [i], "text": text, "dur": d, "chapter": False})
+            continue
+        if cur and cur_dur >= min_dur:
+            beats.append(_beat(cur))
+            cur, cur_dur = [], 0.0
+        cur.append(i)
+        cur_dur += d
+    if cur:
+        beats.append(_beat(cur))
+    print(f"  [GROUP] narration -> {len(beats)} beats (min {min_dur}s of audio "
+          f"per beat -> 1 shot / 1 image per beat)")
+    return beats
+
+
+def _concat_sentence_clips(idxs: list[int], episode_num: int,
+                           lead_idx: int) -> Optional[str]:
+    """Concatenate a beat's sentence clips into ONE shot clip (named
+    narration_{lead_idx:02d}_chunk.wav), with a small 0.15s silence between
+    members so pacing/breath is preserved. Returns the output path, or the
+    single member clip for a one-sentence beat, or None on failure."""
+    ep_dir = _ep_tts_dir(episode_num)
+    out = str(ep_dir / f"narration_{lead_idx:02d}_chunk.wav")
+    clips = [c for c in (_sentence_final_clip(episode_num, i) for i in idxs) if c]
+    if not clips:
+        return None
+    if len(clips) == 1:
+        return clips[0]
+    silence = str(ep_dir / "_silence.wav")
+    if not os.path.isfile(silence) or os.path.getsize(silence) < 100:
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "anullsrc=r=24000:cl=mono", "-t", "0.15",
+                        "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", silence],
+                       capture_output=True, timeout=30)
+    n_clips = len(clips)
+    total_streams = n_clips + (n_clips - 1)
+    inputs: list[str] = []
+    chain: list[str] = []
+    fc: list[str] = []
+    for k, c in enumerate(clips):
+        inputs += ["-i", c]
+        chain.append(f"a{k}")
+        fc.append(f"[{2*k}:a]aresample=24000,"
+                  f"aformat=sample_fmts=s16:channel_layouts=mono[a{k}]")
+        if k < n_clips - 1:
+            inputs += ["-i", silence]
+            chain.append(f"s{k}")
+            fc.append(f"[{2*k+1}:a]aresample=24000,"
+                      f"aformat=sample_fmts=s16:channel_layouts=mono[s{k}]")
+    fc.append("[%s]concat=n=%d:v=0:a=1[out]" % ("][".join(chain), total_streams))
+    cmd = (["ffmpeg", "-y", "-v", "error"] + inputs +
+           ["-filter_complex", ";".join(fc), "-map", "[out]", out])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 1000:
+        return out
+    return None
+
+
 def _phase_llm(config: dict):
     """Run ALL the LLM stages for one episode (article -> narration -> shots ->
     world assets) and START its TTS worker. Returns an ep_ctx dict, or None."""
@@ -15765,6 +15907,38 @@ def _phase_llm(config: dict):
     else:
         print("  [STYLE] test frame failed (ComfyUI not running?) - continuing")
 
+    # TTS BEFORE THE SHOT LIST (Joe 2026-08-17): the min-4s image grouping is
+    # now done WHILE the shot list is generated - each shot = one >=4s chunk of
+    # narration - which requires the real TTS clip durations up front. So TTS
+    # runs FIRST (all clips generated + dialogue split), then the narration is
+    # grouped into >=4s beats, then the shot list builds one shot per beat.
+    # (Trade-off vs the old order: TTS and the LLM no longer overlap on the
+    # GPU - accepted for the image-count win.)
+    _intro_count = 0
+    if intro:
+        _intro_count = len([_s for _s in
+                            re.split(r"(?<=[.!?])\s+", intro[0]) if _s.strip()])
+    tts_thread, tts_results, tts_stop = _start_tts_worker(
+        narration, episode_num, intro_count=_intro_count)
+    print(f"  [TTS] generating ALL narration clips BEFORE the shot list "
+          f"({len(narration)} clips, {_intro_count} intro in announcement voice)...")
+    tts_thread.join(timeout=1800)
+    print("  [TTS] all narration clips done - splitting dialogue voices, "
+          "then grouping into min-4s beats for the shot list...")
+    _finalize_sentence_clips(narration, episode_num, _intro_count)
+    _chunks = _chunk_narration_min4(narration, episode_num)
+    _chunk_texts = [c["text"] for c in _chunks]
+    _chunk_para_map: dict[int, str] = {}
+    _chunk_estab: dict = {}
+    for _ci, _c in enumerate(_chunks):
+        _paras = [sentence_para_map.get(_mi) for _mi in _c["idxs"]
+                  if sentence_para_map.get(_mi)]
+        _chunk_para_map[_ci] = " ".join(dict.fromkeys(_paras)) or _c["text"]
+        for _mi in _c["idxs"]:
+            if _mi in establishing_map:
+                _chunk_estab[_ci] = establishing_map[_mi]
+                break
+
     _shot_bible = dict(bible or {})
     if story_bible and story_bible.get("characters"):
         _shot_bible["characters"] = story_bible["characters"]
@@ -15794,16 +15968,38 @@ def _phase_llm(config: dict):
         _chk_save(_partial)
         _shots_sofar[:] = _partial
 
-    shots = _build_shot_list(narration, bible=_shot_bible, context=context,
-                             establishing_map=establishing_map,
-                             sentence_para_map=sentence_para_map,
+    shots = _build_shot_list(_chunk_texts, bible=_shot_bible, context=context,
+                             establishing_map=_chunk_estab,
+                             sentence_para_map=_chunk_para_map,
                              checkpoint_cb=_chk_cb, checkpoint_every=int(
                                  os.environ.get("SHOT_CHECKPOINT_EVERY", "25")))
     _clear_shotlist_incomplete(episode_num)  # full shot list now on disk
+    # Map chunk-position shots back to their real sentence indices + build each
+    # shot's CONCATENATED TTS clip (all member sentences' clips, voices already
+    # baked per sentence) so the rest of the pipeline (images/render/mix) sees
+    # ONE shot = ONE >=4s beat = ONE image / ONE clip. Chapter beats keep their
+    # single card clip. (Joe 2026-08-17 - min-4s grouping at shot-list time.)
+    for _si, _shot in enumerate(shots):
+        if _si >= len(_chunks):
+            break
+        _c = _chunks[_si]
+        _shot["narration_idx"] = _c["idxs"][0]
+        _shot["narration_idxs"] = list(_c["idxs"])
+        _shot["_chunk_dur"] = round(float(_c["dur"]), 2)
+        if not _shot.get("is_chapter"):
+            _shot["narration"] = _c["text"]
+            _conc = _concat_sentence_clips(_c["idxs"], episode_num,
+                                           _c["idxs"][0])
+            if _conc:
+                _shot["tts_path"] = _conc
+    _n_grouped = sum(1 for s in shots if s.get("narration_idxs") and len(s.get("narration_idxs", [])) > 1)
+    print(f"  [GROUP] shot list: {len(shots)} shots (one per >=4s audio beat; "
+          f"{_n_grouped} merged beats, "
+          f"{sum(1 for s in shots if s.get('is_chapter'))} chapter cards)")
     if _shots_sofar:
         print(f"  [CHECKPOINT] shot list built with incremental saves "
               f"({len(shots)} shots final) - crash-safe throughout")
-    _apply_plan_to_shots(shots, sentence_para_map, plan)  # key words + foley onto shots
+    _apply_plan_to_shots(shots, sentence_para_map, plan, narration_sentences=narration)  # key words + foley onto shots
 
     easter_egg = _ask_easter_egg()
     if easter_egg:
@@ -15828,14 +16024,8 @@ def _phase_llm(config: dict):
     prop_assets = _build_prop_assets(
         context, 43000 + episode_num * 7, _episode_dir(episode_num), brands=brands)
 
-    # Two-voice narration (Joe 2026-08-13): the leading intro sentence(s) speak
-    # in the announcement INTRO_VOICE; chapter 1 onwards uses STORY_VOICE. The
-    # count is persisted in the resume state so a resume regenerates missing
-    # clips with the correct voice.
-    _intro_count = 0
-    if intro:
-        _intro_count = len([_s for _s in
-                            re.split(r"(?<=[.!?])\s+", intro[0]) if _s.strip()])
+    # Two-voice narration count (already computed + used before the shot list;
+    # the worker started there too, so nothing to (re)start here - Joe 2026-08-17).
 
     _save_resume_state("story", episode_num, article_url, topic, shots,
                        character_sheets, chapter_events=chapter_events,
@@ -15846,15 +16036,6 @@ def _phase_llm(config: dict):
                        sentence_para_map=sentence_para_map,
                        establishing_map=establishing_map,
                        intro_count=_intro_count)
-
-    # START TTS AFTER all LLM work is done (Joe 2026-08-12): PocketTTS shares the
-    # GPU with LM Studio, so it must not run while the shot-list/world LLM calls
-    # are in flight. Starting it here means it runs concurrently with the API/cloud
-    # image generation (_phase_images) with the LLM already idle.
-    tts_thread, tts_results, tts_stop = _start_tts_worker(
-        narration, episode_num, intro_count=_intro_count)
-    print(f"  [TTS] worker started after shot-list/world LLM work "
-          f"({len(narration)} clips, {_intro_count} intro in announcement voice)")
 
     return {
         "config": config,
@@ -15874,7 +16055,11 @@ def _phase_tts_join(ep_ctx: dict) -> None:
     _apply_config_env(ep_ctx["config"])
     print("\n[TTS] Waiting for ALL narration clips to finish before image generation...")
     ep_ctx["tts_thread"].join(timeout=1800)
-    _finalize_tts(ep_ctx["shots"], ep_ctx["tts_results"], ep_ctx["episode_num"])
+    # With the shot list built from min-4s narration beats, each shot already
+    # has its concatenated tts_path (set in _phase_llm). Only fall back to the
+    # per-shot finalize for legacy/resumed sentence-level shots missing a clip.
+    if not all(s.get("tts_path") for s in ep_ctx["shots"]):
+        _finalize_tts(ep_ctx["shots"], ep_ctx["tts_results"], ep_ctx["episode_num"])
     _save_resume_state("tts", ep_ctx["episode_num"], ep_ctx["article_url"], ep_ctx["topic"],
                        ep_ctx["shots"], ep_ctx["character_sheets"],
                        chapter_events=ep_ctx["chapter_events"], anchor_events=ep_ctx["anchor_events"],
