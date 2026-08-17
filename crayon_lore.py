@@ -11820,8 +11820,12 @@ def _dialogue_spans_in_sentence(narr: str, paragraph_context: str) -> list[tuple
     para = (paragraph_context or "").strip()
     if not narr or not para:
         return []
-    # Locate narr inside the paragraph (tolerant of leading/trailing whitespace).
+    # Locate narr inside the paragraph (tolerant of leading/trailing whitespace
+    # AND of the first-letter capitalisation _cap_sentence applies on flatten,
+    # which makes an exact case-sensitive find fail and silently drop the clone).
     idx = para.find(narr)
+    if idx < 0:
+        idx = para.lower().find(narr.lower())
     if idx < 0:
         return []
     # Quote-state walk over the whole paragraph: toggle on every double-quote.
@@ -11914,19 +11918,28 @@ def _tts_generate_shot(shot: dict, nidx: int, out_path: str,
 
 def _tts_worker(narration_paras: list[str], episode_num: int,
                 results: dict, stop: threading.Event,
-                intro_count: int = 0) -> None:
+                intro_count: int = 0,
+                sentence_para_map: Optional[dict] = None) -> None:
     """Background worker: queue EVERY narration paragraph into the PocketTTS
     server, one at a time, with retries. Runs concurrently with the shot list,
     character sheets and image generation (the big time win of the pipeline).
 
     results[i] = path of the finished clip (or None on failure). Files are
-    named by NARRATION index (narration_{i:02d}.wav) so they map 1:1 to shots
-    via shot['narration_idx'] even when shot parsing skips a paragraph.
+    named by NARRATION index (narration_{i:02d}.wav / narration_{i:02d}_char.wav)
+    so they map 1:1 to shots via shot['narration_idx'] even when shot parsing
+    skips a paragraph.
+
+    TWO roles in ONE pass (Joe 2026-08-17): every sentence gets exactly one
+    clip here. Narrator-only sentences -> narration_{i:02d}.wav; dialogue
+    sentences (explicit [name] tags OR untagged quoted speech) -> the
+    character clone's narration_{i:02d}_char.wav. Dialogue is NOT regenerated
+    in a later pass (nothing is generated after the worker reports done).
 
     Two-voice narration (Joe 2026-08-13): the first `intro_count` sentences
     (the episode INTRO) are spoken with INTRO_VOICE (announcement, video start);
     everything from chapter 1 onwards uses STORY_VOICE (storytelling, video
-    middle).
+    middle). sentence_para_map ({idx: parent paragraph}) lets cross-sentence
+    quoted dialogue keep its quoted portion in the clone voice.
     """
     ep_dir = _ep_tts_dir(episode_num)
     ep_dir.mkdir(parents=True, exist_ok=True)
@@ -11937,36 +11950,41 @@ def _tts_worker(narration_paras: list[str], episode_num: int,
         if not text:
             continue
         narrator_voice = INTRO_VOICE if i < intro_count else STORY_VOICE
-        # EXPLICIT [name]...[/name] speaker tags select the character's clone
-        # (Joe 2026-08-17): parse the tag -> clone, and send ONLY the dialogue
-        # text to that voice (tags stripped by _tts_generate_shot). This is the
-        # authored, authoritative signal, so the WORKER honours it too - the raw
-        # "[big-tony]...[/big-tony]" string is never sent to the TTS model in the
-        # narrator voice. Tag detection is deterministic (no LLM), keeping the
-        # parallel phase fast; untagged dialogue is fully routed by
-        # _finalize_sentence_clips right after this worker joins.
+        para_ctx = (sentence_para_map or {}).get(i)
+        # RESOLVE A CHARACTER CLONE IN THE SINGLE TTS PASS: both explicit
+        # [name]...[/name] tags (deterministic, fast) and untagged quoted
+        # dialogue (LLM speaker detection, only fires on quote/tag text) are
+        # handled here, so dialogue is never regenerated after the worker
+        # reports done. paragraph_context is threaded through so cross-sentence
+        # quoted dialogue keeps its quoted portion in the clone voice.
+        char_voice = None
         tag_spk = _tagged_speaker_in(text)
         if tag_spk and str(tag_spk).lower() not in ("narrator", "narr", "the narrator"):
             char_voice = _resolve_character_voice(tag_spk)
-            if char_voice:
-                out_c = str(ep_dir / f"narration_{i:02d}_char.wav")
-                if _tts_clip_matches(ep_dir, i, text, char=True, path=out_c):
-                    results[i] = out_c
-                    print(f"  [TTS {i+1}/{len(narration_paras)}] reused clone ({_get_audio_duration(out_c):.1f}s)")
-                    time.sleep(0.2)
-                    continue
-                pseudo = {"narration": text, "narration_idx": i, "is_chapter": False}
-                if _tts_generate_shot(pseudo, i, out_c, char_voice=char_voice,
-                                      narrator_voice=narrator_voice):
-                    _normalize_voice_0db(out_c)
-                    _tts_map_record(ep_dir, i, text, char=True)
-                    results[i] = out_c
-                    print(f"  [TTS {i+1}/{len(narration_paras)}] CLONE "
-                          f"{_voice_label(char_voice)} "
-                          f"{_get_audio_duration(out_c):.1f}s - "
-                          f"{_strip_speaker_tags(text)[:50]}...")
-                    time.sleep(0.2)
-                    continue
+        elif '"' in text or "[" in text:
+            _pseudo = {"narration": text, "narration_idx": i,
+                       "is_chapter": False, "paragraph_context": para_ctx}
+            char_voice = _shot_dialogue_voice(_pseudo)
+        if char_voice:
+            out_c = str(ep_dir / f"narration_{i:02d}_char.wav")
+            if _tts_clip_matches(ep_dir, i, text, char=True, path=out_c):
+                results[i] = out_c
+                print(f"  [TTS {i+1}/{len(narration_paras)}] reused clone ({_get_audio_duration(out_c):.1f}s)")
+                time.sleep(0.2)
+                continue
+            pseudo = {"narration": text, "narration_idx": i, "is_chapter": False,
+                      "paragraph_context": para_ctx}
+            if _tts_generate_shot(pseudo, i, out_c, char_voice=char_voice,
+                                  narrator_voice=narrator_voice):
+                _normalize_voice_0db(out_c)
+                _tts_map_record(ep_dir, i, text, char=True)
+                results[i] = out_c
+                print(f"  [TTS {i+1}/{len(narration_paras)}] CLONE "
+                      f"{_voice_label(char_voice)} "
+                      f"{_get_audio_duration(out_c):.1f}s - "
+                      f"{_strip_speaker_tags(text)[:50]}...")
+                time.sleep(0.2)
+                continue
         # Narrator clip (pure narration / fallback): SPEAKER TAGS ARE STRIPPED
         # so the raw "[name]" markers are never read aloud by the TTS model.
         clean = _strip_speaker_tags(text)
@@ -11995,7 +12013,8 @@ def _tts_worker(narration_paras: list[str], episode_num: int,
 
 
 def _start_tts_worker(narration_paras: list[str], episode_num: int,
-                      intro_count: int = 0):
+                      intro_count: int = 0,
+                      sentence_para_map: Optional[dict] = None):
     """Kick off TTS generation in a background thread. Returns (thread, results,
     stop_event). Join the thread before rendering. intro_count = number of
     leading sentences spoken with INTRO_VOICE (announcement)."""
@@ -12006,7 +12025,7 @@ def _start_tts_worker(narration_paras: list[str], episode_num: int,
     stop = threading.Event()
     t = threading.Thread(target=_tts_worker,
                          args=(narration_paras, episode_num, results, stop,
-                               n_intro),
+                               n_intro, sentence_para_map),
                          daemon=True)
     t.start()
     return t, results, stop
@@ -16178,11 +16197,15 @@ def _sentence_dur(narration: list[str], i: int, episode_num: int) -> float:
 
 
 def _finalize_sentence_clips(narration: list[str], episode_num: int,
-                             intro_count: int) -> None:
+                             intro_count: int,
+                             sentence_para_map: Optional[dict] = None) -> None:
     """Generate the per-character dialogue split clip for every dialogue
     sentence (the clone reads the quoted line, the narrator the attribution),
     so each sentence has its FINAL voice clip before chunk durations are
-    measured (Joe 2026-08-17 - chunked shot list needs real durations)."""
+    measured (Joe 2026-08-17 - chunked shot list needs real durations).
+    sentence_para_map ({sentence_idx: parent paragraph}) is threaded through
+    so cross-sentence quoted dialogue still gets its quoted portion in the
+    call characters' clone voice instead of the narrator (Joe 2026-08-17)."""
     ep_dir = _ep_tts_dir(episode_num)
     made = 0
     for i, text in enumerate(narration):
@@ -16192,7 +16215,8 @@ def _finalize_sentence_clips(narration: list[str], episode_num: int,
         out_v = str(ep_dir / f"narration_{nidx:02d}_char.wav")
         if _tts_clip_matches(ep_dir, nidx, text, char=True, path=out_v):
             continue
-        pseudo = {"narration": text, "narration_idx": nidx, "is_chapter": False}
+        pseudo = {"narration": text, "narration_idx": nidx, "is_chapter": False,
+                  "paragraph_context": (sentence_para_map or {}).get(i, text)}
         voice = _shot_dialogue_voice(pseudo)
         if not voice:
             continue
@@ -16465,13 +16489,16 @@ def _phase_llm(config: dict):
         _intro_count = len([_s for _s in
                             re.split(r"(?<=[.!?])\s+", intro[0]) if _s.strip()])
     tts_thread, tts_results, tts_stop = _start_tts_worker(
-        narration, episode_num, intro_count=_intro_count)
+        narration, episode_num, intro_count=_intro_count,
+        sentence_para_map=sentence_para_map)
     print(f"  [TTS] generating ALL narration clips BEFORE the shot list "
           f"({len(narration)} clips, {_intro_count} intro in announcement voice)...")
     tts_thread.join(timeout=1800)
-    print("  [TTS] all narration clips done - splitting dialogue voices, "
-          "then grouping into 2-sentence beats for the shot list...")
-    _finalize_sentence_clips(narration, episode_num, _intro_count)
+    # Dialogue clone clips are generated IN the worker's single pass, so nothing
+    # is regenerated after "done" - just group the finished clips into 2-sentence
+    # beats for the shot list (Joe 2026-08-17).
+    print("  [TTS] all narration clips done - grouping into 2-sentence beats "
+          "for the shot list...")
     _chunks = _chunk_narration_2s(narration, episode_num)
     _chunk_texts = [c["text"] for c in _chunks]
     _chunk_para_map: dict[int, str] = {}
