@@ -443,13 +443,87 @@ def _is_pet_duck(name: str) -> bool:
     )
 
 
+def _fuzzy_find_new_clone(target_dir: Path, char_name: str) -> Optional[str]:
+    """Fuzzy-scan a voice-refs dir for a just-dropped voice clone (Joe
+    2026-08-17): a file whose name overlaps the character name wins; otherwise
+    the newest WAV dropped in the last 10 minutes. Returns None if neither
+    (nothing new on disk yet)."""
+    files = [f for f in target_dir.glob("*.wav") if f.is_file()]
+    if not files:
+        return None
+    tokens = set(re.findall(r"[a-z0-9]+", _char_safe(char_name)))
+    def _score(f: Path):
+        name_toks = set(re.findall(r"[a-z0-9]+", f.stem.lower()))
+        return (len(tokens & name_toks), f.stat().st_mtime)
+    files.sort(key=_score, reverse=True)
+    best = files[0]
+    overlap, mtime = _score(best)
+    if overlap > 0 or (time.time() - mtime) < 600:
+        return str(best)
+    return None
+
+
+def _prompt_install_voice(char_name: str, gender: str) -> Optional[str]:
+    """No unused gender-matched voice left: STALL and ask Joe to install a new
+    voice clone instead of reusing another character's voice (Joe 2026-08-17).
+    Prints the exact directory + suggested filename (so a new clone can be
+    dropped straight in), waits for Enter, then fuzzy-scans that directory and
+    returns the picked-up clone path. Returns None when skipped / non-tty
+    (line falls back to the narrator - NEVER a wrong-gender voice)."""
+    safe = _char_safe(char_name) or "character"
+    target_dir = _HERMES_VOICE_REFS
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    import sys as _sys
+    interactive = bool(getattr(_sys.stdin, "isatty", lambda: False)())
+    if os.environ.get("LORE_VOICE_PROMPT", "1").strip().lower() in (
+            "0", "no", "false", "off"):
+        interactive = False
+    if not interactive:
+        print(f"  [VOICE] WARN: no unused {gender} voice for '{char_name}' - "
+              f"non-interactive run, this line falls back to the narrator")
+        return None
+    while True:
+        print("\n  [VOICE] *** NO UNUSED " + gender.upper() + " VOICE LEFT ***")
+        print(f"  [VOICE] Character: {char_name}  (gender: {gender})")
+        print(f"  [VOICE] Every {gender} catalog voice is already used by "
+              f"another character - a NEW voice is needed so no character "
+              f"ever shares or loses its voice.")
+        print(f"  [VOICE] Install a new voice clone:")
+        print(f"          copy your new {gender} voice clone WAV into:")
+        print(f"          {target_dir}")
+        print(f"          suggested filename: {safe}_{gender}.wav")
+        print(f"          (if you're cloning a NEW voice, keep the source "
+              f"recording handy - that file goes into Hermes voice-refs / "
+              f"PocketTTS on this PC)")
+        try:
+            resp = input("  [VOICE] Press Enter when the clone is in place "
+                         "(or 'skip' to use the narrator): ").strip().lower()
+        except EOFError:
+            return None
+        if resp in ("skip", "s", "cancel", "no", "n", "narrator"):
+            return None
+        found = _fuzzy_find_new_clone(target_dir, char_name)
+        if found:
+            print(f"  [VOICE] picked up new voice clone: {Path(found).name}"
+                  f" -> {char_name}")
+            return found
+        print("  [VOICE] no new WAV found yet - check the path above and "
+              "press Enter again (or 'skip').")
+
+
 def _resolve_character_voice(name: str) -> Optional[str]:
     """Resolve the voice for a named character. Order:
       1) Crayon Diet real clone (if it's one of the 5)
       2) a PINNED override (explicit character->voice pins)
-      3) a persisted assignment (keeps the same voice across runs)
+      3) a persisted assignment (keeps the same voice across runs - a
+         character STAYS on its assigned voice, never re-routed)
       4) an archetype-matching Sassy/Bob/Kanye clone
       5) a default PocketTTS catalog voice matching the character's gender
+      6) interactive install prompt for a NEW clone (never wrong-gender reuse)
+      7) narrator fallback (non-interactive only)
      Guarantees no two characters share a voice."""
     n = (name or "").strip()
     if not n:
@@ -488,12 +562,16 @@ def _resolve_character_voice(name: str) -> Optional[str]:
             _CHAR_VOICE_ASSIGN[low] = v
             _save_voice_assignments()
             return v
-    # Pool exhausted (unlikely) - reuse the least-used default of either gender.
-    for v in _DEFAULT_MALE_VOICES + _DEFAULT_FEMALE_VOICES:
-        if v not in used:
-            _CHAR_VOICE_ASSIGN[low] = v
-            _save_voice_assignments()
-            return v
+    # 6) No unused gender-matched voice left - STALL and ask Joe to install a
+    #    new clone (Joe 2026-08-17). NEVER reach into the other gender's pool:
+    #    a wrong-gender voice is what caused Margaret/Priya to sound male.
+    clone = _prompt_install_voice(n, gender)
+    if clone:
+        _CHAR_VOICE_ASSIGN[low] = clone
+        _save_voice_assignments()
+        return clone
+    # 7) Non-interactive / skipped: leave the line on the narrator rather than
+    #    share or gender-mismatch a voice.
     return None
 
 
@@ -4898,6 +4976,10 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
         v = _resolve_character_voice(speaker)
         if v:
             return v
+        # Speaker known but has no voice yet (install prompt skipped / no
+        # clone available): leave the line on the narrator - do NOT re-prompt
+        # through the on-screen-character fallback for the same character.
+        return None
     # Fallback: the shot's on-screen character is a known speaking character.
     for ch in _parse_shot_characters(shot):
         v = _resolve_character_voice(ch["name"])
