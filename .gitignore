@@ -22,6 +22,7 @@ episodes/
 .resume_state.ep*.json.bak
 narration_plan.json
 character_voice_assignments.json
+voice_decisions.json
 
 # Test / debug artifacts
 zoom_frames_*/

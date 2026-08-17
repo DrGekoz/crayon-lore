@@ -2,6 +2,42 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.38] - 2026-08-17
+
+### Feature: explicit speaker tags = bulletproof dialogue voice routing
+
+The narration (LLM-written OR read verbatim from a lore `.md`) can now carry
+explicit `[name]"quoted line"[/name]` speaker tags wrapping every quoted line.
+A tag is authored with full context at write-time, so the router trusts it over
+the LLM-context guess and the heuristic — this is the fix for the "dialogue
+fell to the story voice" and "wrong clone" bugs. The 10 Obsidian lore `.md`
+files were rewritten with the correct tags for every character.
+
+- **Fix 1 - speaker tags win.** `_shot_dialogue_voice` checks for a `[name]`
+  tag first and routes to that clone directly. Tags are also parsed in
+  `_split_dialogue_segments` so the clone reads only the quoted words and the
+  `said X` attribution stays on the narrator. `[narrator]` keeps a line on the
+  narrator voice (e.g. the flock as a collective).
+- **Fix 2 - fuzzy name matching.** `_llm_detect_speaker` and tag resolution
+  now use a normalised name-similarity match instead of strict canonical
+  equality, so 'The Duck Pope' / 'duck-pope' / 'pope' / a typo all resolve to
+  the right clone instead of silently falling to the heuristic.
+- **Fix 5 - persistent speaker decisions.** Paragraph -> speaker decisions are
+  cached to `voice_decisions.json` (gitignored) so re-runs and resumes are
+  stable and debuggable instead of re-asking the LLM every run.
+- **Fix 4 - no cross-speaker beats.** `_chunk_narration_min4` breaks a beat when
+  the speaker changes, so a shot (one image + one voice) never mixes two
+  characters.
+- **Fix 7 - fidelity-first writing rules.** Narration prompt rules 18b/18c now
+  require the writer to emit speaker tags and forbid merging/re-attributing or
+  dropping a speaker's words.
+- **Fix 8 - visible fallback warning.** A quoted shot that resolves to no
+  speaker prints a loud `[VOICE-WARN]` instead of silently landing on the
+  narrator.
+- **Fix 9 - auto-register aliases.** New LLM/tag name variants are registered
+  as aliases for their matched character, so future detections of the same
+  spelling resolve.
+
 ## [1.0.15] - 2026-08-16
 
 ### Fix: render progress bar no longer freezes at 100% during the faststart moov rewrite

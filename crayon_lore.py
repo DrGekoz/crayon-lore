@@ -3403,16 +3403,27 @@ NARRATION_SYSTEM_PROMPT = (
     "cast - the Duck Pope, Broccolini Biceps, Big Tony Mozarella, Bro-Tech, and "
     "Skibidi Sarah - ALWAYS speak in character, plus any other named character in "
     "the story should get their own voice too. Format EVERY spoken line as quoted "
-    "dialogue with the speaker NAMED in the same sentence, e.g. '\"Quack, and know "
-    "peace,\" said the Duck Pope.' or 'Big Tony slammed the table. \"You call that "
-    "a round?\"' or 'Skibidi Sarah leaned in. \"And that is how we win.\"' or a "
-    "back-and-forth: '\"You first,\" said Bro-Tech. \"No, after you,\" the Duck Pope "
-    "quacked.' The pipeline routes each quoted sentence to that speaker's OWN voice "
-    "clone, so ALWAYS name the speaker and keep their words in quotes. Never write "
-    "dialogue without naming who says it, and never let two characters' words share "
-    "one quoted sentence (split them so each gets its own sentence). Keep the "
-    "narrator's descriptive voice separate from the characters' spoken lines; only "
-    "the quoted words are the character speaking, everything else is narration.\n"
+    "dialogue with the speaker NAMED in the same sentence.\n"
+    "18b. SPEAKER TAGS (STRICT, Crayon Lore, Joe 2026-08-17): wrap EVERY quoted "
+    "spoken line in an explicit speaker tag so the voice router can never mis-route "
+    "it. Put the tag IMMEDIATELY around the quoted words, before the attribution: "
+    "[duck-pope]\"Quack, and know peace.\"[/duck-pope] said the Duck Pope, and his "
+    "voice rolled. Or: Big Tony slammed the table. [big-tony]\"You call that a "
+    "round?\"[/big-tony] Or back-and-forth: [bro-tech]\"You first,\"[/bro-tech] said "
+    "Bro-Tech. [duck-pope]\"No, after you,\"[/duck-pope] the Duck Pope quacked. Use a "
+    "hyphenated tag name matching the character (duck-pope, broccolini-biceps, "
+    "big-tony, bro-tech, skibidi-sarah, darrel, margaret, errol, cormac, priya, "
+    "sven, nonna-rosa, salvatore, rat-pope, narrator for narration). The tag wraps "
+    "ONLY the quoted words; the 'said X' attribution stays OUTSIDE the tag (the "
+    "narrator reads it). A speaker tag is how the pipeline knows which voice clone "
+    "reads that line - NEVER write dialogue without a tag, and never let two "
+    "characters' tagged words share one sentence (split them so each gets its own "
+    "sentence).\n"
+    "18c. FIDELITY (STRICT, Crayon Lore, Joe 2026-08-17): never merge two speakers' "
+    "quotes into one paragraph without keeping each line tagged and attributed, "
+    "never drop or re-attribute a speaker's words, and never let a quoted line "
+    "lose its tag or its named speaker. Preserve every quoted line you write - "
+    "dialogue is the core of the show and must survive exactly as tagged.\n"
     "I will give you a block of pasted lore plus story context. Your job: EXPAND "
     "it into a gripping, chaptered story narration. Write in the present tense, cinematic, "
     "dramatic - build suspense, then resolve triumphantly near the end. Keep the "
@@ -5123,13 +5134,31 @@ def _llm_known_speaker_list() -> list[str]:
 
 
 def _llm_detect_speaker(narr: str) -> Optional[str]:
-    """Ask the LLM to read the WHOLE paragraph and identify the speaker of the
-    quoted line from the known cast, based on the surrounding context (not just
-    a verb lookup). Returns the canonical speaker name or None. Fails open to
-    None (so the caller falls back to the heuristic) on any LLM error."""
+    """Determine the speaker of a quoted line. Order (Joe 2026-08-17, fixes
+    1/2/5/7/8/9):
+      1. An EXPLICIT speaker tag ([name]...[/name]) if present - the most
+         reliable signal, authored with full context. Resolves via fuzzy
+         name match so 'the duck pope' / 'duck-pope' / 'pope' all land.
+      2. The persistent decision cache (paragraph -> speaker from a prior run).
+      3. The LLM reading the whole paragraph (temp 0.0), validated with fuzzy
+         name similarity (fix 2) instead of strict equality; the answer is
+         registered as an alias (fix 9) and the decision persisted (fix 5).
+    Fails open to None (caller falls back to the heuristic) on any error.
+    """
     text = (narr or "").strip()
     if not text or '"' not in text:
         return None
+    # 1) Explicit speaker tag is authoritative.
+    tag_spk = _tagged_speaker_in(text)
+    if tag_spk:
+        known = _llm_known_speaker_list()
+        if not known:
+            return None
+        fuzzy = _fuzzy_match_speaker(tag_spk, known)
+        if fuzzy:
+            _persist_speaker_decision(text, fuzzy)
+            return fuzzy
+    # 2) Persistent cache hit.
     if text in _LLM_SPEAKER_CACHE:
         return _LLM_SPEAKER_CACHE[text]
     if not _LLM_VOICE_CHECK_ON:
@@ -5158,20 +5187,193 @@ def _llm_detect_speaker(narr: str) -> Optional[str]:
         return None
     if not ans:
         return None
-    # Clean + canonicalise whatever the model returned.
+    # Clean whatever the model returned.
     ans = ans.strip().strip('"\'').strip()
     if not ans or ans.upper() in ("NONE", "NOBODY", "NO ONE", "N/A", "NULL",
                                   "UNKNOWN", "NARRATOR"):
-        _LLM_SPEAKER_CACHE[text] = None
+        _persist_speaker_decision(text, None)
         return None
+    # Fuzzy-match the answer to a known speaker (fix 2 + fix 9): instead of a
+    # strict canonical equality that silently rejected 'the Duck Pope' /
+    # 'duck-pope' / a typo and fell to the heuristic (the root cause of the
+    # wrong-voice fallthrough), map near-misses to the closest known speaker.
+    fuzzy = _fuzzy_match_speaker(ans, known)
+    if fuzzy:
+        _persist_speaker_decision(text, fuzzy)
+        return fuzzy
     canon = _canonical_character_name(ans)
-    if canon.lower() not in {c.lower() for c in known}:
-        # Model gave a name/alias we can't resolve to a known speaker - fall
-        # back to the heuristic rather than guess a wrong clone.
-        _LLM_SPEAKER_CACHE[text] = None
+    if canon.lower() in {c.lower() for c in known}:
+        _persist_speaker_decision(text, canon)
+        return canon
+    # Model gave a name/alias we can't resolve to a known speaker - fall back
+    # to the heuristic rather than guess a wrong clone.
+    _persist_speaker_decision(text, None)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Explicit speaker tags (Joe 2026-08-17) - fixes 1/2/5/7/8/9
+# ---------------------------------------------------------------------------
+# The narration (whether written by the LLM OR read verbatim from a lore .md)
+# can carry EXPLICIT speaker tags wrapping each quoted line, e.g.:
+#   [duck-pope]"Quack, and know peace."[/duck-pope] said the Duck Pope, and his
+#   voice rolled over the crowd.
+# A tag is the MOST reliable speaker signal: it is authored with full context
+# at write-time, so the router trusts it over the LLM-context guess and the
+# heuristic. Tags are supported in BOTH the LLM-written narration (rule 18 now
+# instructs the writer to emit them) and verbatim .md files (so a no-rewrite
+# file run still routes every line to the right clone). Untagged text still
+# falls back to the LLM-context + heuristic path, so nothing regresses.
+_SPEAKER_TAG_RE = re.compile(r"\[([A-Za-z0-9 _\-]+)\](.*?)\[/\1\]", re.DOTALL)
+
+
+def _extract_speaker_tags(text: str) -> list[tuple[str, int, int]]:
+    """Return [(speaker, start, end)] for every explicit [name]...[/name] tag
+    in `text` (end = index just past the closing tag). Speaker is the raw tag
+    name (canonicalised by the caller). Empty if no tags."""
+    out = []
+    for m in _SPEAKER_TAG_RE.finditer(text or ""):
+        out.append((m.group(1).strip(), m.start(), m.end()))
+    return out
+
+
+def _strip_speaker_tags(text: str) -> str:
+    """Remove [name] and [/name] markers so the tag text never reaches TTS."""
+    if not text or "[" not in text:
+        return text
+    text = _SPEAKER_TAG_RE.sub(lambda m: m.group(2), text or "")
+    text = re.sub(r"\[/?[A-Za-z0-9 _\-]+\]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _tagged_speaker_in(text: str) -> Optional[str]:
+    """Canonical speaker name of the FIRST speaker tag in `text`, or None.
+    Handles hyphenated tag names (duck-pope, nonna-rosa, bro-tech...) by
+    normalising hyphens to spaces AND fuzzy-matching the known cast, so a tag
+    authoring variant always lands on the right canonical character."""
+    tags = _extract_speaker_tags(text)
+    if not tags:
         return None
-    _LLM_SPEAKER_CACHE[text] = canon
-    return canon
+    raw = tags[0][0]
+    # A 'narrator' tag is explicit: the line stays in the narrator voice.
+    if raw.lower() in ("narrator", "narr", "the narrator"):
+        return "narrator"
+    # Hyphenated tag name -> spaced display name ('duck-pope' -> 'duck pope').
+    spaced = raw.replace("-", " ").strip()
+    known = _llm_known_speaker_list()
+    if known:
+        # direct canonical first
+        canon = _canonical_character_name(spaced)
+        if canon.lower() in {c.lower() for c in known}:
+            return canon
+        # fuzzy for authoring variants ('broccolini-biceps' vs 'Broccolini Biceps')
+        fuzzy = _fuzzy_match_speaker(spaced, known)
+        if fuzzy:
+            return fuzzy
+    return _canonical_character_name(spaced) or _canonical_character_name(raw)
+
+
+def _name_similarity(a: str, b: str) -> float:
+    """Normalised name similarity (0..1) for fuzzy speaker matching (fix 2).
+    Lowercase, strips articles/role titles and non-letters, then Levenshtein
+    ratio - so 'The Duck Pope' vs 'Duck Pope' vs 'Pope' rank highly."""
+    def _norm(s: str) -> str:
+        s = (s or "").lower().strip()
+        s = re.sub(r"\b(the|a|an|old|young|great|his|her)\b", " ", s)
+        return re.sub(r"[^a-z0-9]", "", s)
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    def _lev(x: str, y: str) -> int:
+        if len(x) < len(y):
+            x, y = y, x
+        prev = list(range(len(y) + 1))
+        for i, cx in enumerate(x, 1):
+            cur = [i]
+            for j, cy in enumerate(y, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                               prev[j - 1] + (cx != cy)))
+            prev = cur
+        return prev[-1]
+    d = _lev(na, nb)
+    return 1.0 - (d / max(len(na), len(nb)))
+
+
+def _fuzzy_match_speaker(answer: str, known: list[str]) -> Optional[str]:
+    """Best-known-speaker match for an LLM/tag answer via name similarity
+    (fix 2 + fix 9). Returns the canonical known name when the closest match
+    clears the threshold, else None. Registers the answer as an alias for the
+    matched character so future detections of the same variant also resolve."""
+    if not answer:
+        return None
+    best, best_score = None, 0.0
+    for k in known:
+        sc = _name_similarity(answer, k)
+        if sc > best_score:
+            best, best_score = k, sc
+    if best and best_score >= 0.72:
+        # Fix 9: teach the router this variant maps to the matched character.
+        if answer.strip().lower() != best.lower():
+            try:
+                _register_character_alias(best, answer.strip())
+            except Exception:
+                pass
+        return best
+    return None
+
+
+# Persistent speaker-decision cache (fix 5): paragraph text -> canonical speaker.
+# Persisted to PROJECT_DIR/voice_decisions.json so re-runs / resumes are stable
+# and debuggable instead of re-asking the LLM (and getting a different answer)
+# every run. This is separate from _LLM_SPEAKER_CACHE (run-local) - on load we
+# seed the run cache from disk; on a hit we also persist.
+_VOICE_DECISIONS_FILE = PROJECT_DIR / "voice_decisions.json"
+_VOICE_DECISIONS: dict[str, Optional[str]] = {}
+if _VOICE_DECISIONS_FILE.is_file():
+    try:
+        _VOICE_DECISIONS = json.loads(_VOICE_DECISIONS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        _VOICE_DECISIONS = {}
+_LLM_SPEAKER_CACHE.update(_VOICE_DECISIONS)
+
+
+def _save_voice_decisions() -> None:
+    try:
+        _VOICE_DECISIONS_FILE.write_text(
+            json.dumps(_VOICE_DECISIONS, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _persist_speaker_decision(text: str, speaker: Optional[str]) -> None:
+    """Record a paragraph -> speaker decision both in the run cache and on
+    disk (fix 5). None means 'explicitly no speaker' (also cached so we don't
+    re-ask)."""
+    if not text:
+        return
+    _LLM_SPEAKER_CACHE[text] = speaker
+    _VOICE_DECISIONS[text] = speaker
+    _save_voice_decisions()
+
+
+def _register_character_alias(canonical: str, alias: str) -> None:
+    """Fix 9: map an alternate spelling/variant to its canonical character so
+    future dialogue routing resolves it. Safe no-op for empty/dup aliases."""
+    alias = (alias or "").strip()
+    canonical = (canonical or "").strip()
+    if not alias or not canonical:
+        return
+    low = alias.lower()
+    if low == canonical.lower():
+        return
+    for al in _CHARACTER_ALIASES.get(canonical, []):
+        if al.lower() == low:
+            return
+    _CHARACTER_ALIASES.setdefault(canonical, []).append(alias)
+    _CRAYON_VOICE_ALIAS.setdefault(low, canonical.lower())
 
 
 def _shot_dialogue_voice(shot) -> Optional[str]:
@@ -5204,6 +5406,21 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
     # inside a quote that opened in the previous shot.
     if '"' not in ctx:
         return None
+    # 0) An EXPLICIT speaker tag on the shot itself is the most reliable signal
+    #    (fix 1): it is authored with full context, so trust it before the LLM.
+    tag_spk = _tagged_speaker_in(narr) or _tagged_speaker_in(ctx)
+    if tag_spk:
+        if str(tag_spk).lower() in ("narrator", "narr", "the narrator"):
+            # Explicit narrator tag: stay in the narrator voice, no clone.
+            print(f"  [VOICE] {shot.get('narration_idx','?'):>3} tag: narrator")
+            return None
+        v = _resolve_character_voice(tag_spk)
+        if v:
+            print(f"  [VOICE] {shot.get('narration_idx','?'):>3} tag: "
+                  f"{tag_spk!r} -> {_voice_label(v)}")
+            return v
+        # Tagged speaker is known but has no voice yet - fall through so the
+        # LLM/heuristic can still try (it may resolve a different valid voice).
     # LLM-context speaker check FIRST (Joe 2026-08-17): read the whole paragraph
     # and decide who speaks, so an indirect/ambiguous attribution still routes
     # to the right clone. Falls back to the heuristic when the LLM is down.
@@ -5226,6 +5443,12 @@ def _shot_dialogue_voice(shot) -> Optional[str]:
         # clone available): leave the line on the narrator - do NOT re-prompt
         # through the on-screen-character fallback for the same character.
         return None
+    # Fix 8: a shot that IS quoted dialogue but resolved to nobody silently
+    # fell to the narrator, hiding mis-routing. Surface it loudly so a wrong
+    # voice (or a missing clone) is visible instead of baked into the video.
+    if ctx.count('"') >= 2 or _extract_speaker_tags(ctx):
+        print(f"  [VOICE-WARN] idx {shot.get('narration_idx','?'):>3} quoted "
+              f"dialogue resolved to NO speaker -> narrator voice: {narr[:60]}...")
     # Fallback: the shot's on-screen character is a known speaking character.
     for ch in _parse_shot_characters(shot):
         v = _resolve_character_voice(ch["name"])
@@ -11470,6 +11693,37 @@ def _split_dialogue_segments(narr: str, char_voice: Optional[str],
     narr = (narr or "").strip()
     if not narr:
         return []
+    # 0) EXPLICIT speaker tags are the most reliable split (fix 1): each
+    #    [name]...[/name] span is the quoted dialogue (clone voice), everything
+    #    else (attribution + surrounding narration) is the narrator. This is how
+    #    verbatim .md files and LLM-written narration carry speaker ownership,
+    #    so the clone reads exactly the tagged span and never the attribution.
+    tags = _extract_speaker_tags(narr)
+    if tags and char_voice:
+        segs: list[tuple[str, Optional[str]]] = []
+        pos = 0
+        for _spk, s, e in tags:
+            lead = narr[pos:s].strip()
+            if lead:
+                segs.append((lead, None))          # narration before the tag
+            segs.append((narr[s:e], char_voice))   # the tagged quoted dialogue
+            pos = e
+        tail = narr[pos:].strip()
+        if tail:
+            segs.append((tail, None))              # narration after the tag
+        # strip tag markers from the clone segment text, merge narrator runs
+        merged: list[tuple[str, Optional[str]]] = []
+        for text, voice in segs:
+            text = _strip_speaker_tags(text)
+            if not text:
+                continue
+            if voice is None and merged and merged[-1][1] is None:
+                merged[-1] = (merged[-1][0] + " " + text, None)
+            else:
+                merged.append((text, voice))
+        merged = [(t, v) for t, v in merged if t.strip()]
+        if merged:
+            return merged if merged else [(narr, None)]
     # Quoted spans (double-quoted dialogue) get the clone voice; everything else
     # outside the quotes is the narrator (attribution + surrounding narration).
     # Use the full paragraph's quote state when available so cross-sentence
@@ -11578,7 +11832,8 @@ def _tts_generate_shot(shot: dict, nidx: int, out_path: str,
                                     paragraph_context=shot.get("paragraph_context"))
     if len(segs) <= 1:
         v = segs[0][1] if segs else None
-        return _pocket_tts_generate(text, out_path, voice=v or narrator_voice)
+        return _pocket_tts_generate(_strip_speaker_tags(text), out_path,
+                                    voice=v or narrator_voice)
     tmpdir = tempfile.mkdtemp(prefix=f"cl_seg_{nidx}_")
     parts: list[str] = []
     try:
@@ -15884,34 +16139,65 @@ def _chunk_narration_min4(narration: list[str], episode_num: int,
     beats: list[dict] = []
     cur: list[int] = []
     cur_dur = 0.0
+    _cur_spk = None  # speaker of the current beat (fix 4)
     for i, text in enumerate(narration):
         if not text:
             continue
         if CHAPTER_RE.match(text):
             if cur:
                 beats.append(_beat(cur))
-                cur, cur_dur = [], 0.0
+                cur, cur_dur, _cur_spk = [], 0.0, None
             beats.append({"idxs": [i], "text": text,
                           "dur": _sentence_dur(narration, i, episode_num),
                           "chapter": True})
             continue
         d = _sentence_dur(narration, i, episode_num)
-        if d >= min_dur:
+        # Fix 4 (Joe 2026-08-17): NEVER merge two different speakers into one
+        # beat/shot - a beat is one image + one voice, so a speaker change must
+        # force a beat break even if the running beat is under min_dur. Speaker
+        # is determined from an explicit tag, or a named attribution fallback.
+        spk = _tagged_speaker_in(text)
+        if spk is None:
+            spk = _sentence_speaker_hint(narration, i)
+        if d >= min_dur or (_cur_spk is not None and spk is not None
+                            and spk.lower() != _cur_spk.lower()):
             if cur:
                 beats.append(_beat(cur))
                 cur, cur_dur = [], 0.0
             beats.append({"idxs": [i], "text": text, "dur": d, "chapter": False})
+            _cur_spk = spk
             continue
         if cur and cur_dur >= min_dur:
             beats.append(_beat(cur))
             cur, cur_dur = [], 0.0
+        if spk is not None:
+            _cur_spk = spk
         cur.append(i)
         cur_dur += d
     if cur:
         beats.append(_beat(cur))
     print(f"  [GROUP] narration -> {len(beats)} beats (min {min_dur}s of audio "
-          f"per beat -> 1 shot / 1 image per beat)")
+          f"per beat -> 1 shot / 1 image per beat, speaker boundaries respected)")
     return beats
+
+
+def _sentence_speaker_hint(narration: list[str], i: int) -> Optional[str]:
+    """Best-effort speaker for a narration sentence with no explicit tag, used
+    only to keep beats single-speaker (fix 4). Returns a canonical name if a
+    clear attribution appears in the sentence, else None (narrator/mixed)."""
+    t = (narration[i] if 0 <= i < len(narration) else "") or ""
+    if '"' not in t:
+        return None
+    try:
+        spk = _llm_detect_speaker(t)
+        if spk:
+            return spk
+    except Exception:
+        pass
+    try:
+        return _detect_speaker(t)
+    except Exception:
+        return None
 
 
 def _concat_sentence_clips(idxs: list[int], episode_num: int,
