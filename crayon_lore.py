@@ -10794,6 +10794,97 @@ def _build_all_character_sheets(shots: list[dict],
     return sheets_cache
 
 
+def _wav_duration(path: str) -> float:
+    """Seconds of audio for a WAV (ffprobe, fast). Returns 0.0 on any error."""
+    if not path or not os.path.isfile(path):
+        return 0.0
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=15)
+        return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0.0
+    except Exception:
+        return 0.0
+
+
+def _shot_tts_duration(shot: dict) -> float:
+    """Audio duration for a shot's narration clip: the real TTS wav when it
+    exists, else an estimate (~3.2 words/sec). Used for min-4s image grouping
+    (Joe 2026-08-17)."""
+    tp = shot.get("tts_path")
+    if tp and os.path.isfile(tp):
+        d = _wav_duration(tp)
+        if d > 0.0:
+            return d
+    words = len(re.findall(r"\S+", shot.get("narration") or ""))
+    return words / 3.2
+
+
+def _group_shots_min4(shots: list[dict], episode_num: int,
+                      min_dur: float = 4.0) -> int:
+    """Group narration shots into chunks of >= min_dur seconds that share ONE
+    image, so image-gen never creates more images than needed (Joe 2026-08-17).
+
+    - A shot whose TTS is >= min_dur gets its own image.
+    - Shorter shots accumulate onto one image until the running total reaches
+      min_dur, then the next shot opens a new image.
+    - Chapter shots keep their own title-card image (never merged).
+    Followers get `image_lead` = list index of the group lead, and their
+    image_path points at the lead's deterministic output file (the render pass
+    merges consecutive same-image clips). Returns the number of images after
+    merging (incl. solo shots + chapter cards)."""
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    cur_dur = 0.0
+    for i, s in enumerate(shots):
+        if s.get("is_chapter"):
+            if cur:  # close any open short-chunk group before a chapter
+                groups.append(cur)
+                cur, cur_dur = [], 0.0
+            groups.append([i])
+            continue
+        d = _shot_tts_duration(s)
+        if d >= min_dur:
+            if cur:
+                groups.append(cur)
+                cur, cur_dur = [], 0.0
+            groups.append([i])
+            continue
+        if cur and cur_dur >= min_dur:
+            groups.append(cur)
+            cur, cur_dur = [], 0.0
+        cur.append(i)
+        cur_dur += d
+    if cur:
+        groups.append(cur)
+
+    # Clear any stale grouping from a previous run, then mark leads/followers.
+    for s in shots:
+        s.pop("image_lead", None)
+    n_images = 0
+    for g in groups:
+        if not g:
+            continue
+        lead = shots[g[0]]
+        if len(g) == 1:
+            if not lead.get("is_chapter"):
+                n_images += 1
+            continue
+        lead_dir = _episode_dir(episode_num) if episode_num else EPISODES_DIR
+        lead_seq = int(lead.get("seq", 0) or (lead.get("narration_idx", g[0]) + 1))
+        lead_path = str(lead_dir / _shot_filename(lead, lead_seq))
+        for fi in g[1:]:
+            shots[fi]["image_lead"] = g[0]
+            shots[fi]["image_path"] = lead_path
+        total = sum(_shot_tts_duration(shots[j]) for j in g)
+        print(f"  [GROUP] {len(g)} shots -> 1 image (lead #{lead_seq}, "
+              f"{total:.1f}s audio): " + ", ".join(
+                  str(shots[j].get("narration_idx", j) + 1) for j in g[1:]))
+        n_images += 1
+    return n_images
+
+
 def _generate_all_shots(shots: list[dict], character_sheets: Optional[dict] = None,
                         episode_num: int = 0,
                         context: Optional[dict] = None,
@@ -10858,12 +10949,22 @@ def _generate_all_shots(shots: list[dict], character_sheets: Optional[dict] = No
             shots, character_sheets, sheets_dir, 70000 + episode_num,
             sheets_cache=sheets)
 
+    # ---- MIN-4s IMAGE GROUPING (Joe 2026-08-17) ----
+    # Shots whose TTS is shorter than 4s share ONE image until their combined
+    # audio hits 4s - never generate more images than needed. Followers skip
+    # generation and reuse the group lead's output file; the render pass merges
+    # consecutive same-image clips into one continuous segment.
+    _n_groups = _group_shots_min4(shots, episode_num)
+    print(f"  [IMAGES] {len(shots)} shots grouped into {_n_groups} images "
+          f"(min 4s of audio per image - followers share the lead's image)")
+
     # ---- SHOT-PROMPT VERIFICATION DEFINITIONS (used by cards + chunked render) ----
     from concurrent.futures import ThreadPoolExecutor as _TPE
     CHUNK = max(1, min(int(os.environ.get("SHOT_CHUNK_SIZE", "5")), len(shots) or 1))
     _regen = os.environ.get("REGEN_IMAGES", "0").strip().lower() in ("1", "yes", "y", "true")
     _todo = [s for s in shots
              if not s.get("is_chapter")
+             and s.get("image_lead") is None
              and (_regen or not _shot_image_ok(s))]
 
     def _verify_chunk(chunk: list) -> int:
@@ -10975,6 +11076,11 @@ def _generate_all_shots(shots: list[dict], character_sheets: Optional[dict] = No
             else:
                 with _plock:
                     print(f"  [SHOT {idx+1}/{len(shots)}] chapter placeholder (no image)")
+            return
+        # Grouped follower (Joe 2026-08-17): shares the group LEAD's image
+        # (min-4s chunks) - its image_path already points at the lead's file,
+        # so there is nothing to generate here.
+        if shot.get("image_lead") is not None:
             return
         # REGEN_IMAGES=1 -> force re-generate (overwrite) instead of resuming.
         _regen = os.environ.get("REGEN_IMAGES", "0").strip().lower() in ("1", "yes", "y", "true")
