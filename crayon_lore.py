@@ -226,6 +226,15 @@ _CLONE_SASSY = str(_HERMES_VOICE_REFS / "sassy.wav")            # female
 _CLONE_BOB = str(_HERMES_VOICE_REFS / "bobthebuilder.wav")       # male
 _CLONE_KANYE = str(_HERMES_VOICE_REFS / "cyclopskanye.wav")      # male
 
+# Pinned character -> voice (Joe 2026-08-17): canonical lowercase name -> clone
+# path. Pins override every other resolution rule (persisted assignments,
+# archetype matching, gender defaults) so named characters ALWAYS speak with
+# the chosen voice. A pinned file that's missing falls through to normal
+# resolution instead of erroring.
+_PINNED_CHAR_VOICES = {
+    "darrel": _CLONE_SASSY,   # Darrel the cyber-duck -> Sassy clone
+}
+
 
 def _voice_usable(p: str) -> bool:
     """Clone paths only usable if the file exists; built-in names always ok."""
@@ -312,6 +321,30 @@ def _register_bible_characters(bible: dict) -> None:
             gender=str(prot.get("gender") or "male").lower(),
             role=str(prot.get("role") or ""),
         )
+    # Gender-consistency cleanup (Joe 2026-08-17): an assignment persisted
+    # BEFORE the bible registered a character's gender can pin the WRONG pool
+    # ('margaret' -> 'javert' male when the bible says female). Drop any
+    # persisted CATALOG voice whose gender contradicts the bible so the
+    # character re-resolves from the correct pool; clone paths are kept.
+    _changed = False
+    for _cn, _cg in list(_CHAR_GENDER.items()):
+        if _cg not in ("male", "female"):
+            continue
+        _cv = _CHAR_VOICE_ASSIGN.get(_cn)
+        if not _cv:
+            continue
+        _is_catalog = not ((":" in _cv) and ("\\" in _cv or "/" in _cv))
+        if not _is_catalog:
+            continue
+        _wrong = (_cg == "female" and _cv in _DEFAULT_MALE_VOICES) or \
+                 (_cg == "male" and _cv in _DEFAULT_FEMALE_VOICES)
+        if _wrong:
+            print(f"  [VOICE] {_cn}: dropped stale '{_cv}' assignment "
+                  f"(bible gender={_cg}) - re-resolving")
+            del _CHAR_VOICE_ASSIGN[_cn]
+            _changed = True
+    if _changed:
+        _save_voice_assignments()
 
 
 # Title / filler words dropped when auto-deriving a short alias from a full
@@ -396,35 +429,59 @@ def _gender_for(name: str) -> str:
     return "male"
 
 
+def _is_pet_duck(name: str) -> bool:
+    """'Duck' the PET (bible-registered as its own character alongside 'Duck
+    Pope') is not the Pope - never fold it into the Pope's clone/voice. When
+    both 'duck' and 'duck pope' are in the roster, bare 'Duck' resolves via
+    the normal assignment path (gender default), not the CD clone. Without
+    both in the roster, 'duck' keeps meaning 'duck pope' (alias fallback)."""
+    n = (name or "").strip().lower()
+    return (
+        n in ("duck", "the duck", "pet duck")
+        and "duck" in _CHAR_GENDER
+        and "duck pope" in _CHAR_GENDER
+    )
+
+
 def _resolve_character_voice(name: str) -> Optional[str]:
     """Resolve the voice for a named character. Order:
       1) Crayon Diet real clone (if it's one of the 5)
-      2) a persisted assignment (keeps the same voice across runs)
-      3) an archetype-matching Sassy/Bob/Kanye clone
-      4) a default PocketTTS catalog voice matching the character's gender
+      2) a PINNED override (explicit character->voice pins)
+      3) a persisted assignment (keeps the same voice across runs)
+      4) an archetype-matching Sassy/Bob/Kanye clone
+      5) a default PocketTTS catalog voice matching the character's gender
      Guarantees no two characters share a voice."""
     n = (name or "").strip()
     if not n:
         return None
-    # 1) Crayon Diet clones (their real debate-show voices).
-    cd = _character_voice(n)
+    # 1) Crayon Diet clones (their real debate-show voices). The pet 'Duck'
+    #    is exempt so it can't hijack the Pope's clone when both are in roster.
+    cd = _character_voice(n) if not _is_pet_duck(n) else None
     if cd:
         return cd
-    # 2) Already assigned.
     low = n.lower()
+    # 2) Pinned override (Joe 2026-08-17): explicit character->voice pins.
+    pin = _PINNED_CHAR_VOICES.get(low)
+    if pin and not _voice_usable(pin):
+        pin = None  # pinned file missing - fall through to normal resolution
+    if pin:
+        _CHAR_VOICE_ASSIGN[low] = pin
+        _save_voice_assignments()
+        return pin
+    # 3) Already assigned.
     if low in _CHAR_VOICE_ASSIGN:
         v = _CHAR_VOICE_ASSIGN[low]
         return v if _voice_usable(v) else None
     gender = _gender_for(n)
     role = _CHAR_ROLE.get(low, "")
-    # 3) archetype clone (Sassy/Bob/Kanye) if it matches and is free.
+    # 4) archetype clone (Sassy/Bob/Kanye) if it matches and is free.
     arch = _archetype_voice(n, role, gender)
     used = set(_CHAR_VOICE_ASSIGN.values())
     if arch and arch not in used and _voice_usable(arch):
         _CHAR_VOICE_ASSIGN[low] = arch
         _save_voice_assignments()
         return arch
-    # 4) default PocketTTS catalog voice by gender, first unused.
+    # 5) default PocketTTS catalog voice by gender, first unused.
     pool = _DEFAULT_FEMALE_VOICES if gender == "female" else _DEFAULT_MALE_VOICES
     for v in pool:
         if v not in used:
@@ -2549,14 +2606,60 @@ def _rate_paragraph_relevance(topic: str, paragraphs: list[str]) -> list[str]:
     print(f"  [FILTER] Kept {len(kept)}/{len(paragraphs)} paragraphs/segments")
     return kept
 
+def _is_local_path(url: str) -> bool:
+    """True when a 'url' is really a local file path (Windows drive, ./, ../,
+    UNC, or a path that exists on disk). Keeps urllib away from file paths so
+    a resume re-fetch of a vault lore file never throws 'unknown url type: f'.
+    (Joe 2026-08-17)"""
+    if not url:
+        return False
+    low = url.lower()
+    if low.startswith(("http://", "https://", "file://", "ftp://", "data:")):
+        return False
+    return (
+        bool(re.match(r"^[A-Za-z]:[\\/]", url))
+        or url.startswith((".", "/", "\\"))
+        or os.path.isfile(url)
+    )
+
+
 def fetch_article_paragraphs(url: str) -> list[str]:
     """Download a web article, extract <p> tags for clean paragraphs.
 
     Hardened injection: strips nav/footer/aside/script containers before
     extraction, filters boilerplate/promo junk, dedupes repeats, and caps
     the result so off-topic webpage chrome never reaches the narration LLM.
+    Local .md/.txt lore files are read directly (resume re-fetch path).
     """
     print(f"  [ARTICLE] Fetching: {url}")
+    # Local lore file (.md/.txt): read + paragraph-split it directly instead
+    # of handing a Windows path to urllib (Joe 2026-08-17).
+    if _is_local_path(url):
+        lp = Path(url)
+        if not lp.is_file():
+            print(f"  [FAIL] Fetch failed: file not found: {url}")
+            return []
+        try:
+            text = lp.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception as e:
+            print(f"  [FAIL] Fetch failed: {e}")
+            return []
+        if not text:
+            print("  [FAIL] Fetch failed: file is empty")
+            return []
+        _, _t, paras = _lore_to_article(text, source=str(lp))
+        seen = set()
+        clean = []
+        for p in paras:
+            if len(p) <= 100 or _is_junk_paragraph(p):
+                continue
+            norm = re.sub(r'[^a-z0-9]+', '', p.lower())
+            if norm in seen:
+                continue
+            seen.add(norm)
+            clean.append(p)
+        print(f"  [OK] {len(clean)} paragraphs from local lore file (junk-filtered)")
+        return clean[:40]
     try:
         ssl_ctx = ssl._create_unverified_context()
         req = urllib.request.Request(url, headers={
@@ -6806,7 +6909,11 @@ def _build_character_sheets(shots: list[dict], narration: list[str],
                 bible_meta[str(c.get("name")).strip()] = (
                     str(c.get("gender", "")), str(c.get("age", "")))
     sheets = {}
-    for s in shots:
+    seen_canonical = set()  # print each canonical-image char ONCE, not per shot
+    _shot_iter = (tqdm(shots, desc="  [CAST] character sheets",
+                       unit="shot", leave=False)
+                  if _HAS_PROGRESS else shots)
+    for s in _shot_iter:
         raw = (s.get("character") or "NONE").strip()
         if raw.upper() in ("NONE", "N/A", "NOBODY", "NO ONE", "-", ""):
             continue
@@ -6824,17 +6931,40 @@ def _build_character_sheets(shots: list[dict], narration: list[str],
                 print(f"  [CAST] {c} -> SKIP (business/entity, not a person)")
                 continue
             # CRAYON DIET canonical characters use their bot image directly as
-            # the shot ref - no sheet generation needed (Joe 2026-08-15).
-            if _crayon_diet_ref(c):
-                print(f"  [CAST] {c} -> Crayon Diet canonical image (no sheet)")
+            # the shot ref - no sheet generation needed (Joe 2026-08-15). Log
+            # the ACTUAL resolved ref file so the terminal shows which image
+            # each character maps to (Joe 2026-08-17).
+            _cd_ref = _crayon_diet_ref(c)
+            if _cd_ref:
+                if c not in seen_canonical:
+                    seen_canonical.add(c)
+                    print(f"  [CAST] {c} -> ref: {os.path.basename(_cd_ref)}"
+                          f" (canonical, no sheet)")
                 continue
             # New / obscure lore characters: LLM writes a CUSTOM sheet from the
             # lore ONLY (NO fixed archetype roster - Joe 2026-08-15).
             role = s.get("character_role", "")
             ctx = _character_context(narration, c)
-            sheets[c] = _llm_character_sheet(c, role, s.get("scene", ""), ctx)
+            sheet = _llm_character_sheet(c, role, s.get("scene", ""), ctx)
+            sheets[c] = sheet
+            # LLM gender check (Joe 2026-08-17): the LLM character sheet
+            # derives the character's gender from the lore text. The story
+            # bible only covers bible-listed characters, so feed the sheet's
+            # gender into the voice router too - obscure characters then get a
+            # gender-matched voice exactly like bible-registered ones. Bible
+            # gender still wins on conflict (setdefault, never clobber).
+            _g = str(sheet.get("gender") or "").lower().strip()
+            if _g in ("male", "female"):
+                for _cn in (c, _canonical_character_name(c)):
+                    _cl = (_cn or "").strip().lower()
+                    if _cl and _cl not in _CHAR_GENDER:
+                        _CHAR_GENDER[_cl] = _g
+                register_character_aliases(c, gender=_g, role=role)
+            _portrait = f"{_char_safe(_canonical_character_name(c))}_single.png"
             print(f"  [CAST] {c} -> lore-custom LLM character sheet"
-                  f"{f' (role: {role})' if role else ''}")
+                  f"{f' (role: {role})' if role else ''}"
+                  f"{f' [gender: {_g}]' if _g else ''}"
+                  f" -> portrait: {_portrait}")
     print(f"  [CAST] {len(sheets)} character sheets (lore-custom LLM + Crayon Diet canonical)")
     return sheets
 
@@ -13305,10 +13435,10 @@ def _post_discord_announcement(topic: str, video_id: str, episode_num: int,
 def print_banner():
     print("""
   ==============================================
-        SPLIT NODE
-  True stories of ordinary people who
-        beat the system.
-  3D animated documentary, AI generated.
+        CRAYON LORE
+   The backstory and lore of the
+      Crayon Diet universe.
+   AI storytelling, fully automated.
   ==============================================
 """)
 
@@ -14341,6 +14471,7 @@ def _resume_episode(state: dict) -> None:
             # rebuild the character sheets/refs so a missed character (Darrel,
             # Margaret, ...) is finally locked into the roster. No full script
             # rebuild - narration, shots and TTS are untouched. (Joe 2026-08-17)
+            print("  [BIBLE] step 1/3: loading lore/article source...")
             _bible_src = None
             if article_url:
                 try:
@@ -14354,9 +14485,12 @@ def _resume_episode(state: dict) -> None:
                 print("  [BIBLE] no narration/article to detect characters from - "
                       "cannot regenerate the story bible")
             else:
+                print(f"  [BIBLE] step 2/3: building story bible from "
+                      f"{len(list(_bible_src))} paragraph(s)...")
                 _rebuilt_bible = _build_story_bible(topic, list(_bible_src))
                 _register_bible_characters(_rebuilt_bible)
                 _resume_bible = _rebuilt_bible
+                print("  [BIBLE] step 3/3: rebuilding character sheets/refs...")
                 character_sheets = _build_character_sheets(
                     shots, state.get("narration")
                     or [s.get("narration", "") for s in shots],
