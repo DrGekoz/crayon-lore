@@ -3985,18 +3985,31 @@ def _build_narration_script(paragraphs: list[str],
                        "after the intro sequence. Cold-open into the action, plant "
                        "the deeper problem early. Do NOT use the '...but the story "
                        "doesn't end there' twist-tease - that belongs to the intro "
-                       "sequence only (rule 17), never here.")
+                       "sequence only (rule 17), never here. DIALOGUE: NONE in the "
+                       "opening - keep this opening paragraph pure narration; save "
+                       "all character dialogue for the body/chapter segments "
+                       "(Joe 2026-08-17).")
         elif i >= n_art - 1:
             section = ("SECTION: EPISODE OUTRO / FINAL PARAGRAPHS - the ending. "
                        "Resolve triumphantly, pay off the transformation and the "
                        "deeper problem, echo the opening, and END the episode cleanly "
                        "on the final fact or win. No twist-tease, no dangling "
-                       "rhetorical question at the end.")
+                       "rhetorical question at the end. DIALOGUE: NONE in the "
+                       "outro - a brief final character line is allowed at most, but "
+                       "keep the ending mostly pure narration so it lands as a "
+                       "closing statement (Joe 2026-08-17).")
         else:
             section = ("SECTION: EPISODE BODY - the middle of the story. Develop the "
                        "action and the cause-and-effect chain. Vary every paragraph's "
                        "ending; never end consecutive paragraphs with a question or a "
-                       "tease (rule 17).")
+                       "tease (rule 17). DIALOGUE: HEAVY here (Joe 2026-08-17) - this "
+                       "is where the characters speak. Write a LOT of quoted dialogue "
+                       "in these body/chapter paragraphs: every character present who "
+                       "has something to say should get a quoted line, back-and-forth "
+                       "exchanges between characters are encouraged, and most body "
+                       "paragraphs should contain at least one quoted spoken line " 
+                       "tagged per rule 18b. The intro and outro stay narration-only; "
+                       "the body is where the voices carry the story.")
         # Generate ALL the per_para narration paragraphs for this article
         # paragraph in ONE LLM call (Joe 2026-08-13: per-paragraph calls drift
         # and repeat beats near the end of a long video, and the returned

@@ -2,6 +2,22 @@
 
 All notable changes to Crayon Lore.
 
+## [1.0.39] - 2026-08-17
+
+### Feature: LLM-written scripts get heavy dialogue in the body, none in intro/outro
+
+When the LLM writes the narration script (rewrite mode), the section guidance
+now tells it where dialogue belongs:
+- **Episode opening** and **outro/final paragraphs**: pure narration — no
+  character dialogue (a single brief final line allowed at most in the outro).
+- **Body/chapter segments**: HEAVY dialogue — every present character who has
+  something to say gets a quoted line, back-and-forth exchanges are encouraged,
+  and most body paragraphs contain at least one tagged quoted line (rule 18b).
+
+This makes LLM-authored episodes match the hand-authored lore `.md` files' dense
+dialogue in the chapters, while keeping the intro and outro as narration landing
+the tone. Wired into the per-paragraph `SECTION:` guidance in `_build_narration_script`.
+
 ## [1.0.38] - 2026-08-17
 
 ### Feature: explicit speaker tags = bulletproof dialogue voice routing
